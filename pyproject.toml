@@ -1,0 +1,35 @@
+[project]
+name = "analysis"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">3.12"
+dependencies = [
+    "ipykernel>=6.29.5",
+]
+authors = [
+    {name = "Andrew Scherer", email = "andrew@sourcedepth.com"}
+]
+license = "MIT"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "scripts" }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "T201",   # print statements in code
+    "RET504", # unnecessary assignment for return
+    "D203",   # incorrect blank line before class
+    "D213",   # multi-line summary second line
+    "CPY001", # missing copyright notice
+]
+
+[tool.ruff.lint.isort]
+known-first-party = []
