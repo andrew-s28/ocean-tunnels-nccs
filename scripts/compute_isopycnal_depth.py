@@ -16,7 +16,7 @@ from scipy.optimize import brentq as find_root
 from tqdm import tqdm
 from zarr.errors import ZarrUserWarning
 
-from utils import open_grid_with_zdepths, open_model_fields
+from utils import get_isopycnal_depth_path, open_grid_with_zdepths, open_model_fields
 
 
 def _setup_cluster() -> Client:
@@ -93,7 +93,7 @@ def concatenate_slices(parent_path: Path, slices_dir: Path, target_sigma_0: floa
 
     """
     print("Concatenating all slices into a single dataset...", end="", flush=True)
-    slice_files = list(slices_dir.glob(f"isopycnal_depth_{target_sigma_0}_slice_*.zarr"))
+    slice_files = list(slices_dir.glob("isopycnal_depth_slice_*.zarr"))
     slice_files.sort()
     isopycnal_depth = xr.concat(
         [xr.open_zarr(f) for f in slice_files],
@@ -101,7 +101,8 @@ def concatenate_slices(parent_path: Path, slices_dir: Path, target_sigma_0: floa
         compat="no_conflicts",
         coords="minimal",
     )["depth"]
-    isopycnal_depth.to_zarr(parent_path / f"isopycnal_depth_{target_sigma_0}.zarr")
+    isopycnal_depth_path = get_isopycnal_depth_path(parent_path, target_sigma_0)
+    isopycnal_depth.to_zarr(isopycnal_depth_path)
     print("done.")
 
     print("Cleaning up slice files...", end="", flush=True)
@@ -173,7 +174,7 @@ def compute_isopycnal_depth(parent_path: str | Path, target_sigma_0: float, time
     if isinstance(parent_path, str):
         parent_path = Path(parent_path)
 
-    slices_dir = parent_path / f"isopycnal_depth_{target_sigma_0}"
+    slices_dir = get_isopycnal_depth_path(parent_path, target_sigma_0).with_name("isopycnal_depth_slices")
     slices_dir.mkdir(exist_ok=True)
 
     with _setup_cluster() as client:
@@ -199,7 +200,7 @@ def compute_isopycnal_depth(parent_path: str | Path, target_sigma_0: float, time
             isopycnal_depth_slice = process_chunk(ds_slice, grid, target_sigma_0)
 
             # Save the computed isopycnal depths for this slice to a separate NetCDF file, ~1GB total per slice
-            save_path = slices_dir / f"isopycnal_depth_{target_sigma_0}_slice_{i + 1}.zarr"
+            save_path = slices_dir / f"isopycnal_depth_slice_{i + 1}.zarr"
             if save_path.exists():
                 print(f"File {save_path} already exists. Skipping computation.")
                 continue

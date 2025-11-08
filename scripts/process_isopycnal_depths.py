@@ -6,9 +6,10 @@ Runs the following steps in order:
  3. Compute and save monthly mean isopycnal depths to a zarr store using `calculate_monthly_mean_isopycnal_depth.py`.
 """
 
-from calculate_monthly_mean_isopycnal_depth import save_monthly_mean_isopycnal_depth
 from compute_isopycnal_depth import compute_isopycnal_depth
+from compute_monthly_mean_isopycnal_depth import compute_monthly_mean_isopycnal_depth
 from compute_z_levels import compute_depth_and_pressure
+from utils import get_isopycnal_depth_path
 
 if __name__ == "__main__":
     parent_path = "D:/avg/"
@@ -21,5 +22,7 @@ if __name__ == "__main__":
     time_slice_size = 100
     compute_isopycnal_depth(parent_path, target_sigma_0, time_slice_size)
 
+    isopycnal_depth_path = get_isopycnal_depth_path(parent_path, target_sigma_0)
+
     # Step 3: Compute and save monthly mean isopycnal depths to a zarr store
-    save_monthly_mean_isopycnal_depth()
+    compute_monthly_mean_isopycnal_depth(isopycnal_depth_path)

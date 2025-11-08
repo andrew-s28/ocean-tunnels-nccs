@@ -95,3 +95,21 @@ def open_grid_with_zdepths(parent_path: str | Path) -> xr.Dataset:
 
     ds_grid = xr.open_dataset(grid_file)
     return ds_grid
+
+
+def get_isopycnal_depth_path(parent_path: str | Path, target_sigma_0: float) -> Path:
+    """Get the path to the isopycnal depth zarr directory.
+
+    Args:
+        parent_path (str | Path): Path to the parent directory containing the isopycnal depth data.
+        target_sigma_0 (float): The target sigma_0 value for the isopycnal depth.
+
+    Returns:
+        Path: The path to the isopycnal depth zarr directory.
+
+    """
+    if isinstance(parent_path, str):
+        parent_path = Path(parent_path)
+
+    isopycnal_depth_path = parent_path / f"isopycnal_depth_{target_sigma_0}.zarr"
+    return isopycnal_depth_path
