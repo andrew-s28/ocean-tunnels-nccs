@@ -7,16 +7,21 @@ from pathlib import Path
 
 import xarray as xr
 
+from utils import get_isopycnal_depth_path, get_monthly_mean_isopycnal_depth_path
 
-def compute_monthly_mean_isopycnal_depth(isopycnal_depth_path: str | Path) -> None:
+
+def compute_monthly_mean_isopycnal_depth(parent_path: str | Path, target_sigma_0: float) -> None:
     """Compute and save the monthly mean isopycnal depth from saved isopycnal depth slices.
 
     Args:
-        isopycnal_depth_path (str | Path): Path to the zarr directory containing isopycnal depth slices.
+        parent_path (str | Path): Path to the parent directory containing isopycnal depth slices.
+        target_sigma_0 (float): The target sigma_0 value for the isopycnal depth.
 
     """
-    if isinstance(isopycnal_depth_path, str):
-        isopycnal_depth_path = Path(isopycnal_depth_path)
+    if isinstance(parent_path, str):
+        parent_path = Path(parent_path)
+
+    isopycnal_depth_path = get_isopycnal_depth_path(parent_path, target_sigma_0)
 
     # Open the zarr dataset
     ds = xr.open_zarr(isopycnal_depth_path)
@@ -25,10 +30,10 @@ def compute_monthly_mean_isopycnal_depth(isopycnal_depth_path: str | Path) -> No
     monthly_mean_ds = ds.groupby("time.month").mean(dim="time")
 
     # Save the monthly mean dataset
-    save_path = isopycnal_depth_path.parent / f"monthly_mean_{isopycnal_depth_path.name}"
-    monthly_mean_ds.to_zarr(save_path)
-    print(f"Monthly mean isopycnal depth saved to {save_path}.")
+    monthly_mean_path = get_monthly_mean_isopycnal_depth_path(parent_path, target_sigma_0)
+    monthly_mean_ds.to_zarr(monthly_mean_path)
+    print(f"Monthly mean isopycnal depth saved to {monthly_mean_path}.")
 
 
 if __name__ == "__main__":
-    compute_monthly_mean_isopycnal_depth("D:/avg/isopycnal_depth_25.8.zarr")
+    compute_monthly_mean_isopycnal_depth("D:/avg", 25.8)
