@@ -38,4 +38,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["utils", "compute_z_levels", "compute_isopycnal_depth"]
+known-first-party = [
+    "utils",
+    "compute_z_levels",
+    "compute_isopycnal_depth",
+    "calculate_monthly_mean_isopycnal_depth",
+]
