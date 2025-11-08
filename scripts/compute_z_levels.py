@@ -74,23 +74,18 @@ def compute_depths(ds: xr.Dataset, z0: np.ndarray) -> np.ndarray:
     return z
 
 
-if __name__ == "__main__":
-    parent_path = "D:/avg/"
+def setup_dataset(z_rho: np.ndarray, z_w: np.ndarray, ds_grid: xr.Dataset) -> xr.Dataset:
+    """Update the CROCO grid dataset with z-depths and pressures.
 
-    ds_model = open_model_fields(parent_path)
-    ds_grid = open_grid(parent_path)
+    Args:
+        z_rho (np.ndarray): The z-depths at rho points.
+        z_w (np.ndarray): The z-depths at w points.
+        ds_grid (xr.Dataset): The CROCO grid dataset.
 
-    # Only need the first time slice since using time-mean zeta and only need hc, h, zeta variables
-    ds_slice = ds_model.isel(time=0)[["hc", "h", "zeta"]]
-    # Load into memory for faster computation
-    ds_slice.load()
+    Returns:
+        xr.Dataset: The updated CROCO grid dataset with z-depths and pressures added.
 
-    z_0 = compute_vertical_transform(ds_slice, VerticalCoordinate.RHO)
-    z_rho = compute_depths(ds_slice, z_0)
-
-    z_0 = compute_vertical_transform(ds_slice, VerticalCoordinate.W)
-    z_w = compute_depths(ds_slice, z_0)
-
+    """
     # Z-depths at rho points
     ds_grid["z_rho"] = (["eta_rho", "xi_rho", "s_rho"], z_rho)
     ds_grid["z_rho"].attrs["long_name"] = "depth of rho points"
@@ -116,5 +111,35 @@ if __name__ == "__main__":
     )
     ds_grid["p_w"].attrs["long_name"] = "sea pressure at w points"
     ds_grid["p_w"].attrs["units"] = "dbar"
+    return ds_grid
+
+
+def compute_depth_and_pressure(parent_path: str) -> None:
+    """Compute z-depths and pressures for a CROCO model and save to a new grid file.
+
+    Args:
+        parent_path (str): Path to the parent directory where the new grid file will be saved.
+
+    """
+    ds_model = open_model_fields(parent_path)
+    ds_grid = open_grid(parent_path)
+
+    # Only need the first time slice since using time-mean zeta and only need hc, h, zeta variables
+    ds_slice = ds_model.isel(time=0)[["hc", "h", "zeta"]]
+    # Load into memory for faster computation
+    ds_slice.load()
+
+    z_0 = compute_vertical_transform(ds_slice, VerticalCoordinate.RHO)
+    z_rho = compute_depths(ds_slice, z_0)
+
+    z_0 = compute_vertical_transform(ds_slice, VerticalCoordinate.W)
+    z_w = compute_depths(ds_slice, z_0)
+
+    ds_grid = setup_dataset(z_rho, z_w, ds_grid)
 
     ds_grid.to_netcdf(Path(parent_path) / "croco_grd_with_z.nc")
+
+
+if __name__ == "__main__":
+    parent_path = "D:/avg/"
+    compute_depth_and_pressure(parent_path)
