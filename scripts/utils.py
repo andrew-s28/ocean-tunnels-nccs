@@ -4,10 +4,41 @@ import shutil
 import warnings
 from pathlib import Path
 
+import gsw
 import numpy as np
 import xarray as xr
 from dask.distributed import Client, LocalCluster
 from zarr.errors import ZarrUserWarning
+
+
+def compute_sigma_0(ds: xr.Dataset, grid: xr.Dataset) -> xr.Dataset:
+    """Compute sigma_0 from practical salinity and potential temperature.
+
+    Run `compute_z_levels.py` first to calculate rho-pressure levels if needed.
+
+    Args:
+        ds (xr.Dataset): CROCO model with salinity, temperature, and pressure data.
+        grid (xr.Dataset): CROCO grid with longitude and latitude data.
+
+    Returns:
+        xr.Dataset: Dataset with added sigma_0 variable.
+
+    """
+    ds["salt_abs"] = gsw.conversions.SA_from_SP(
+        ds["salt"],
+        grid["p_rho"],
+        grid["lon_rho"],
+        grid["lat_rho"],
+    )
+    ds["temp_con"] = gsw.conversions.CT_from_pt(
+        ds["salt_abs"],
+        ds["temp"],
+    )
+    ds["sigma0"] = gsw.density.sigma0(
+        ds["salt_abs"],
+        ds["temp_con"],
+    )
+    return ds
 
 
 def setup_cluster(n_workers: int, threads_per_worker: int, memory_limit: str) -> Client:
@@ -191,6 +222,24 @@ def open_grid_with_zdepths(parent_path: str | Path) -> xr.Dataset:
     return ds_grid
 
 
+def get_mixed_layer_depth_path(parent_path: str | Path, delta_sigma: float) -> Path:
+    """Get the path to the mixed layer depth zarr directory.
+
+    Args:
+        parent_path (str | Path): Path to the parent directory containing the mixed layer depth data.
+        delta_sigma (float): The sigma_0 threshold for mixed layer depth calculation.
+
+    Returns:
+        Path: The path to the mixed layer depth zarr directory.
+
+    """
+    if isinstance(parent_path, str):
+        parent_path = Path(parent_path)
+
+    mld_path = parent_path / f"mixed_layer_depth_delta_sigma_{delta_sigma}.zarr"
+    return mld_path
+
+
 def get_isopycnal_depth_path(parent_path: str | Path, target_sigma_0: float) -> Path:
     """Get the path to the isopycnal depth zarr directory.
 
@@ -205,7 +254,7 @@ def get_isopycnal_depth_path(parent_path: str | Path, target_sigma_0: float) -> 
     if isinstance(parent_path, str):
         parent_path = Path(parent_path)
 
-    isopycnal_depth_path = parent_path / f"isopycnal_depth_{target_sigma_0}.zarr"
+    isopycnal_depth_path = parent_path / f"isopycnal_depth_sigma_{target_sigma_0}.zarr"
     return isopycnal_depth_path
 
 

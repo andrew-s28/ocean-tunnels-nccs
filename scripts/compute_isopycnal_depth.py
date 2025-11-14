@@ -12,6 +12,7 @@ from scipy.optimize import brentq as find_root
 from tqdm import tqdm
 
 from utils import (
+    compute_sigma_0,
     concatenate_slices,
     get_isopycnal_depth_path,
     open_grid_with_zdepths,
@@ -48,36 +49,6 @@ def interpolate_to_density_level(z: np.ndarray, sigma_0: np.ndarray, target_sigm
     if type(root) is float:
         return root
     return np.nan
-
-
-def compute_sigma_0(ds: xr.Dataset, grid: xr.Dataset) -> xr.Dataset:
-    """Compute sigma_0 from practical salinity and potential temperature.
-
-    Run `compute_z_levels.py` first to calculate rho-pressure levels if needed.
-
-    Args:
-        ds (xr.Dataset): CROCO model with salinity, temperature, and pressure data.
-        grid (xr.Dataset): CROCO grid with longitude and latitude data.
-
-    Returns:
-        xr.Dataset: Dataset with added sigma_0 variable.
-
-    """
-    ds["salt_abs"] = gsw.conversions.SA_from_SP(
-        ds["salt"],
-        grid["p_rho"],
-        grid["lon_rho"],
-        grid["lat_rho"],
-    )
-    ds["temp_con"] = gsw.conversions.CT_from_pt(
-        ds["salt_abs"],
-        ds["temp"],
-    )
-    ds["sigma0"] = gsw.density.sigma0(
-        ds["salt_abs"],
-        ds["temp_con"],
-    )
-    return ds
 
 
 def process_chunk(ds_chunk: xr.Dataset, grid: xr.Dataset, target_sigma_0: float) -> xr.DataArray:
