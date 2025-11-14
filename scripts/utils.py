@@ -1,8 +1,102 @@
 """Utility functions for handling Oceanic Pathways model data."""
 
+import shutil
+import warnings
 from pathlib import Path
 
+import numpy as np
 import xarray as xr
+from dask.distributed import Client, LocalCluster
+from zarr.errors import ZarrUserWarning
+
+
+def setup_cluster(n_workers: int, threads_per_worker: int, memory_limit: str) -> Client:
+    """Set up a Dask distributed cluster for parallel processing.
+
+    Args:
+        n_workers (int): Number of workers in the cluster.
+        threads_per_worker (int): Number of threads per worker.
+        memory_limit (str): Memory limit per worker (e.g., '4GB').
+
+    Returns:
+        Client: A Dask distributed client connected to the cluster.
+
+    """
+    cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit)
+    client = Client(cluster)
+    return client
+
+
+def save_slice(
+    slice_da: xr.DataArray,
+    save_path: Path,
+) -> None:
+    """Save a computed isopycnal depth slice to a zarr file.
+
+    Args:
+        slice_da (xr.DataArray): DataArray containing the computed depths for the slice.
+        save_path (Path): Path to save the zarr file.
+
+    """
+    with warnings.catch_warnings():
+        msg = "Consolidated metadata is currently not part in the Zarr format 3 specification"
+        warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
+        msg = "Sending large graph of size"
+        warnings.filterwarnings("ignore", category=UserWarning, message=msg)
+        slice_da.to_zarr(save_path)
+
+
+def slice_dataset(
+    ds: xr.Dataset,
+    slice_size: int,
+) -> list[xr.Dataset]:
+    """Slice a dataset into smaller datasets along the time dimension.
+
+    Args:
+        ds (xr.Dataset): The input dataset to be sliced.
+        slice_size (int): The number of time steps in each slice.
+
+    Returns:
+        list[xr.Dataset]: A list of sliced datasets.
+
+    """
+    # Find the number of time slices needed
+    number_of_slices = int(np.ceil(len(ds["time"]) / slice_size))
+    slices = [
+        ds.isel(time=slice(i * slice_size, min((i + 1) * slice_size, len(ds.time)))) for i in range(number_of_slices)
+    ]
+    return slices
+
+
+def concatenate_slices(save_path: Path, slices_dir: Path) -> None:
+    """Concatenate all saved slices into a single dataset and remove the slice files.
+
+    Args:
+        save_path (Path): Path to save the concatenated dataset.
+        slices_dir (Path): Directory containing the saved isopycnal depth slices.
+
+    """
+    print("Concatenating all slices into a single dataset...", end="", flush=True)
+    slice_files = list(slices_dir.glob("*slice_*.zarr"))
+    slice_files.sort()
+    isopycnal_depth = xr.concat(
+        [xr.open_zarr(f) for f in slice_files],
+        dim="time",
+        compat="no_conflicts",
+        coords="minimal",
+    )["depth"]
+    with warnings.catch_warnings():
+        msg = "Consolidated metadata is currently not part in the Zarr format 3 specification"
+        warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
+        msg = "Sending large graph of size"
+        warnings.filterwarnings("ignore", category=UserWarning, message=msg)
+        isopycnal_depth.to_zarr(save_path)
+    print("done.")
+
+    print("Cleaning up slice files...", end="", flush=True)
+    [shutil.rmtree(f) for f in slice_files]
+    slices_dir.rmdir()
+    print("done.")
 
 
 def open_model_fields(parent_path: str | Path) -> xr.Dataset:

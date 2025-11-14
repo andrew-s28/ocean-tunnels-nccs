@@ -25,4 +25,4 @@ if __name__ == "__main__":
     isopycnal_depth_path = get_isopycnal_depth_path(parent_path, target_sigma_0)
 
     # Step 3: Compute and save monthly mean isopycnal depths to a zarr store
-    compute_monthly_mean_isopycnal_depth(isopycnal_depth_path)
+    compute_monthly_mean_isopycnal_depth(isopycnal_depth_path, target_sigma_0)

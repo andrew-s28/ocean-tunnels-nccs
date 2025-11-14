@@ -3,26 +3,23 @@
 Intended to be used after running `compute_z_levels.py` to ensure z-depths and pressures are available.
 """
 
-import shutil
-import warnings
 from pathlib import Path
 
 import gsw
 import numpy as np
 import xarray as xr
-from dask.diagnostics.progress import ProgressBar
-from dask.distributed import Client, LocalCluster
 from scipy.optimize import brentq as find_root
 from tqdm import tqdm
-from zarr.errors import ZarrUserWarning
 
-from utils import get_isopycnal_depth_path, open_grid_with_zdepths, open_model_fields
-
-
-def _setup_cluster() -> Client:
-    cluster = LocalCluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB")
-    client = Client(cluster)
-    return client
+from utils import (
+    concatenate_slices,
+    get_isopycnal_depth_path,
+    open_grid_with_zdepths,
+    open_model_fields,
+    save_slice,
+    setup_cluster,
+    slice_dataset,
+)
 
 
 def interpolate_to_density_level(z: np.ndarray, sigma_0: np.ndarray, target_sigma_0: float = 25.8) -> float:
@@ -83,33 +80,6 @@ def compute_sigma_0(ds: xr.Dataset, grid: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def concatenate_slices(parent_path: Path, slices_dir: Path, target_sigma_0: float) -> None:
-    """Concatenate all saved isopycnal depth slices into a single dataset and remove the slice files.
-
-    Args:
-        parent_path (Path): Parent directory to save the concatenated dataset.
-        slices_dir (Path): Directory containing the saved isopycnal depth slices.
-        target_sigma_0 (float): The target sigma_0 value used in the slice filenames.
-
-    """
-    print("Concatenating all slices into a single dataset...", end="", flush=True)
-    slice_files = list(slices_dir.glob("isopycnal_depth_slice_*.zarr"))
-    slice_files.sort()
-    isopycnal_depth = xr.concat(
-        [xr.open_zarr(f) for f in slice_files],
-        dim="time",
-        compat="no_conflicts",
-        coords="minimal",
-    )["depth"]
-    isopycnal_depth_path = get_isopycnal_depth_path(parent_path, target_sigma_0)
-    isopycnal_depth.to_zarr(isopycnal_depth_path)
-    print("done.")
-
-    print("Cleaning up slice files...", end="", flush=True)
-    [shutil.rmtree(f) for f in slice_files]
-    print("done.")
-
-
 def process_chunk(ds_chunk: xr.Dataset, grid: xr.Dataset, target_sigma_0: float) -> xr.DataArray:
     """Process a chunk of the dataset to compute isopycnal depths.
 
@@ -140,25 +110,6 @@ def process_chunk(ds_chunk: xr.Dataset, grid: xr.Dataset, target_sigma_0: float)
     return isopycnal_depth_chunk
 
 
-def save_isopycnal_depth_slice(
-    isopycnal_depth_slice: xr.DataArray,
-    save_path: Path,
-) -> None:
-    """Save a computed isopycnal depth slice to a zarr file.
-
-    Args:
-        isopycnal_depth_slice (xr.DataArray): DataArray containing the computed isopycnal depths for the slice.
-        save_path (Path): Path to save the zarr file.
-
-    """
-    with ProgressBar(), warnings.catch_warnings():
-        msg = "Consolidated metadata is currently not part in the Zarr format 3 specification"
-        warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
-        msg = "Sending large graph of size"
-        warnings.filterwarnings("ignore", category=UserWarning, message=msg)
-        isopycnal_depth_slice.to_zarr(save_path)
-
-
 def compute_isopycnal_depth(parent_path: str | Path, target_sigma_0: float, time_slice_size: int) -> None:
     """Compute the depth of a specified isopycnal surface (e.g., sigma_0 = 25.8 kg/m^3) from CROCO model output.
 
@@ -177,7 +128,7 @@ def compute_isopycnal_depth(parent_path: str | Path, target_sigma_0: float, time
     slices_dir = get_isopycnal_depth_path(parent_path, target_sigma_0).with_name("isopycnal_depth_slices")
     slices_dir.mkdir(exist_ok=True)
 
-    with _setup_cluster() as client:
+    with setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
         print(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
 
         print("Opening model fields and grid...", end="", flush=True)
@@ -187,28 +138,25 @@ def compute_isopycnal_depth(parent_path: str | Path, target_sigma_0: float, time
         print("done.")
 
         # Find the number of time slices needed
-        number_of_slices = int(np.ceil(len(ds["time"]) / time_slice_size))
+        dataset_slices = slice_dataset(ds, time_slice_size)
 
         print("Computing and saving isopycnal depth slices...", end="", flush=True)
 
         # Process each chunk of times separately
-        for i in tqdm(range(number_of_slices), desc="Computing isopycnal depth slices"):
-            start_idx = i * time_slice_size
-            end_idx = min((i + 1) * time_slice_size, len(ds["time"]))
-            ds_slice = ds.isel(time=slice(start_idx, end_idx))
-
+        for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing isopycnal depth slices")):
             isopycnal_depth_slice = process_chunk(ds_slice, grid, target_sigma_0)
 
             # Save the computed isopycnal depths for this slice to a separate NetCDF file, ~1GB total per slice
             save_path = slices_dir / f"isopycnal_depth_slice_{i + 1}.zarr"
             if save_path.exists():
-                print(f"File {save_path} already exists. Skipping computation.")
+                tqdm.write(f"File {save_path} already exists. Skipping computation.")
                 continue
-            save_isopycnal_depth_slice(isopycnal_depth_slice, save_path)
+            save_slice(isopycnal_depth_slice, save_path)
 
         print("done.")
 
-        concatenate_slices(parent_path, slices_dir, target_sigma_0)
+        save_path = get_isopycnal_depth_path(parent_path, target_sigma_0)
+        concatenate_slices(save_path, slices_dir)
 
         print("All processing complete.")
         client.close()
