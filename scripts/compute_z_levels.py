@@ -125,7 +125,7 @@ def compute_depth_and_pressure(parent_path: str) -> None:
     ds_grid = open_grid(parent_path)
 
     # Only need the first time slice since using time-mean zeta and only need hc, h, zeta variables
-    ds_slice = ds_model.isel(time=0)[["hc", "h", "zeta"]]
+    ds_slice: xr.Dataset = ds_model.isel(time=0)[["hc", "h", "zeta"]]  # ty: ignore[invalid-assignment]
     # Load into memory for faster computation
     ds_slice.load()
 
