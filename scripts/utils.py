@@ -99,29 +99,34 @@ def slice_dataset(
     return slices
 
 
-def concatenate_slices(save_path: Path, slices_dir: Path) -> None:
+def concatenate_slices(save_path: Path | str, slices_dir: Path | str) -> None:
     """Concatenate all saved slices into a single dataset and remove the slice files.
 
     Args:
-        save_path (Path): Path to save the concatenated dataset.
-        slices_dir (Path): Directory containing the saved isopycnal depth slices.
+        save_path (Path | str): Path to save the concatenated dataset.
+        slices_dir (Path | str): Directory containing the saved isopycnal depth slices.
 
     """
+    if isinstance(save_path, str):
+        save_path = Path(save_path)
+    if isinstance(slices_dir, str):
+        slices_dir = Path(slices_dir)
+
     print("Concatenating all slices into a single dataset...", end="", flush=True)
     slice_files = list(slices_dir.glob("*slice_*.zarr"))
     slice_files.sort()
-    isopycnal_depth = xr.concat(
+    ds = xr.concat(
         [xr.open_zarr(f) for f in slice_files],
         dim="time",
         compat="no_conflicts",
         coords="minimal",
-    )["depth"]
+    )
     with warnings.catch_warnings():
         msg = "Consolidated metadata is currently not part in the Zarr format 3 specification"
         warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
         msg = "Sending large graph of size"
         warnings.filterwarnings("ignore", category=UserWarning, message=msg)
-        isopycnal_depth.to_zarr(save_path)
+        ds.to_zarr(save_path)
     print("done.")
 
     print("Cleaning up slice files...", end="", flush=True)
