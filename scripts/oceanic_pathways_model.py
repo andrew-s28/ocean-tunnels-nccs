@@ -1,3 +1,15 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "gsw",
+#     "numpy",
+#     "scipy",
+#     "tqdm",
+#     "typer",
+#     "xarray[accel,io,parallel]",
+#     "zarr",
+# ]
+# ///
 """Module for computing depths on specific density levels from Oceanic Pathways CROCO model output."""
 
 import shutil
@@ -729,7 +741,15 @@ class DensityAtMixedLayerDepth(BaseDepth):
             client.close()
 
 
-app = typer.Typer(help="Compute depths from CROCO model output. Modes: mld, isopycnal, mld_density")
+app = typer.Typer(
+    context_settings={
+        "help_option_names": ["-h", "--help"],
+    },
+    rich_markup_mode="rich",
+    no_args_is_help=True,
+    add_completion=False,
+    help="Compute depths from CROCO model output. Modes: mld, isopycnal, mld_density",
+)
 
 ALLOWED_MODES = {"mld", "isopycnal", "mld_density"}
 
