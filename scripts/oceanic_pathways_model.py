@@ -12,20 +12,17 @@
 # ///
 """Module for computing depths on specific density levels from Oceanic Pathways CROCO model output."""
 
-import gc
 import shutil
 import warnings
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from pathlib import Path
-from pprint import pprint
 
 import dask.array as da
 import gsw
 import numpy as np
 import typer
 import xarray as xr
-from dask.distributed import Client
 from scipy.optimize import brentq as find_root
 from tqdm import tqdm
 from zarr.errors import ZarrUserWarning
@@ -660,7 +657,7 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
         self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"]
 
-    def _interpolate(self, z: da.Array, sigma_0: xr.DataArray, _depth: da.Array | None = None) -> float:  # noqa: PLR6301
+    def _interpolate(self, z: da.Array, sigma_0: xr.DataArray, _depth: da.Array | None = None) -> float:
         """Interpolate to to find sigma_0 at a given depth.
 
         Intended to be used with the xarray.apply_ufunc defined within this script.
@@ -690,8 +687,7 @@ class DensityAtMixedLayerDepth(BaseDepth):
         return root
 
     def interp_vertical_decreasing(self, depth, var, zt):
-        """
-        depth: (eta, xi, s)
+        """depth: (eta, xi, s)
         var:   (eta, xi, s)
         zt:    (eta, xi)
         returns: (eta, xi)
