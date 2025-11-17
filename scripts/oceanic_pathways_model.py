@@ -12,22 +12,27 @@
 # ///
 """Module for computing depths on specific density levels from Oceanic Pathways CROCO model output."""
 
+import gc
 import shutil
 import warnings
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from pathlib import Path
+from pprint import pprint
 
+import dask.array as da
 import gsw
 import numpy as np
 import typer
 import xarray as xr
+from dask.distributed import Client
 from scipy.optimize import brentq as find_root
 from tqdm import tqdm
 from zarr.errors import ZarrUserWarning
 
 from utils import (
     compute_sigma_0,
+    setup_client,
     setup_cluster,
 )
 
@@ -35,7 +40,12 @@ from utils import (
 class BaseDepth(ABC):
     """Base class for depth calculations from CROCO model output."""
 
-    def __init__(self, save_dir: Path | str, load_dir: Path | str, time_slice_size: int = 100) -> None:
+    def __init__(
+        self,
+        save_dir: Path | str,
+        load_dir: Path | str,
+        time_slice_size: int = 100,
+    ) -> None:
         """Initialize the BaseDepth class.
 
         Args:
@@ -46,8 +56,6 @@ class BaseDepth(ABC):
         """
         self.save_dir = Path(save_dir)
         self.load_dir = Path(load_dir)
-        self.grid = self.open_grid_with_zdepths()
-        self.model = self.open_model_fields()
         self.save_path: Path
         self.slices_dir: Path
         self.monthly_mean_path: Path
@@ -56,20 +64,26 @@ class BaseDepth(ABC):
     def save_slice(
         self,
         slice_da: xr.DataArray,
+        index: int,
     ) -> None:
         """Save a computed isopycnal depth slice to a zarr file.
 
         Args:
             slice_da (xr.DataArray): DataArray containing the computed depths for the slice.
-            save_path (Path): Path to save the zarr file.
+            index (int): Index of the slice to save.
 
         """
+        save_path = self.slices_dir / f"slice_{index}.zarr"
+        # Save the computed isopycnal depths for this slice to a separate NetCDF file, ~1GB total per slice
+        if save_path.exists():
+            tqdm.write(f"File {save_path} already exists. Skipping computation.")
+            return
         with warnings.catch_warnings():
             msg = "Consolidated metadata is currently not part in the Zarr format 3 specification"
             warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
             msg = "Sending large graph of size"
             warnings.filterwarnings("ignore", category=UserWarning, message=msg)
-            slice_da.to_zarr(self.save_path)
+            slice_da.to_zarr(save_path)
 
     def slice_dataset(
         self,
@@ -79,7 +93,6 @@ class BaseDepth(ABC):
 
         Args:
             ds (xr.Dataset): The input dataset to be sliced.
-            slice_size (int): The number of time steps in each slice.
 
         Returns:
             list[xr.Dataset]: A list of sliced datasets.
@@ -93,17 +106,15 @@ class BaseDepth(ABC):
         ]
         return slices
 
-    @staticmethod
-    def concatenate_slices(save_path: Path, slices_dir: Path) -> None:
+    def concatenate_slices(self) -> None:
         """Concatenate all saved slices into a single dataset and remove the slice files.
 
         Args:
-            save_path (Path): Path to save the concatenated dataset.
-            slices_dir (Path): Directory containing the saved isopycnal depth slices.
+            slices_dir (Path): Directory containing the saved slices.
 
         """
-        print("Concatenating all slices into a single dataset...", end="", flush=True)
-        slice_files = list(slices_dir.glob("*.zarr"))
+        typer.echo("Concatenating all slices into a single dataset...", nl=False)
+        slice_files = list(self.slices_dir.glob("*.zarr"))
         slice_files.sort()
         ds = xr.concat(
             [xr.open_zarr(f) for f in slice_files],
@@ -116,13 +127,13 @@ class BaseDepth(ABC):
             warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
             msg = "Sending large graph of size"
             warnings.filterwarnings("ignore", category=UserWarning, message=msg)
-            ds.to_zarr(save_path)
-        print("done.")
+            ds.to_zarr(self.save_path)
+        typer.echo("done.")
 
-        print("Cleaning up slice files...", end="", flush=True)
+        typer.echo("Cleaning up slice files...", nl=False)
         [shutil.rmtree(f) for f in slice_files]
-        slices_dir.rmdir()
-        print("done.")
+        self.slices_dir.rmdir()
+        typer.echo("done.")
 
     def open_model_fields(self) -> xr.Dataset:
         """Open Oceanic Pathways model fields from a parent directory.
@@ -154,6 +165,9 @@ class BaseDepth(ABC):
             compat="equals",
             chunks={"time": 1, "s_rho": -1, "eta_rho": -1, "xi_rho": -1},
         )
+
+        # Only need temperature and salinity for density calculations
+        ds = ds[["temp", "salt", "hc", "h", "zeta"]]
 
         return ds
 
@@ -206,7 +220,7 @@ class BaseDepth(ABC):
 
         # Save the monthly mean dataset
         monthly_mean_ds.to_zarr(self.monthly_mean_path)
-        print(f"Monthly mean isopycnal depth saved to {self.monthly_mean_path}.")
+        typer.echo(f"Monthly mean isopycnal depth saved to {self.monthly_mean_path}.")
 
     def open(self) -> xr.Dataset:
         """Open the isopycnal depth zarr dataset.
@@ -250,12 +264,7 @@ class BaseDepth(ABC):
 
     @abstractmethod
     def compute(self) -> None:
-        """Abstract method to compute depths from CROCO model output.
-
-        Args:
-            time_slice_size (int): Number of time steps to process in each slice.
-
-        """
+        """Abstract method to compute depths from CROCO model output."""
         raise NotImplementedError
 
     @abstractmethod
@@ -304,9 +313,6 @@ class IsopycnalDepth(BaseDepth):
         self.save_path = self.save_dir / f"isopycnal_depth_sigma_{target_sigma_0}.zarr"
         self.slices_dir = self.save_path.with_name("isopycnal_depth_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
-
-        self.save_dir.mkdir(exist_ok=True)
-        self.slices_dir.mkdir(exist_ok=True)
 
     def _interpolate(self, z: np.ndarray, sigma_0: np.ndarray, _depth: np.ndarray | None = None) -> float:
         """Interpolate to find the depth at which the given sigma0 matches the target sigma0.
@@ -367,30 +373,32 @@ class IsopycnalDepth(BaseDepth):
         when used on the Oceanic Pathways model output.
 
         """
-        with setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
-            print(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+        self.save_dir.mkdir(exist_ok=True)
+        self.slices_dir.mkdir(exist_ok=True)
+
+        with setup_client(setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB")) as client:
+            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
+            self.grid = self.open_grid_with_zdepths()
+            self.model = self.open_model_fields()
+            typer.echo("done.")
 
             # Find the number of time slices needed
             dataset_slices = self.slice_dataset(self.model)
 
-            print("Computing and saving isopycnal depth slices...", end="", flush=True)
+            typer.echo("Computing and saving isopycnal depth slices...", nl=False)
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing isopycnal depth slices")):
                 isopycnal_depth_slice = self._process_chunk(ds_slice)
+                self.save_slice(isopycnal_depth_slice, i)
 
-                # Save the computed isopycnal depths for this slice to a separate NetCDF file, ~1GB total per slice
-                save_path = self.slices_dir / f"isopycnal_depth_slice_{i + 1}.zarr"
-                if save_path.exists():
-                    tqdm.write(f"File {save_path} already exists. Skipping computation.")
-                    continue
-                self.save_slice(isopycnal_depth_slice)
+            typer.echo("done.")
 
-            print("done.")
+            self.concatenate_slices()
 
-            self.concatenate_slices(self.save_path, self.slices_dir)
+            typer.echo("All processing complete.")
 
-            print("All processing complete.")
             client.close()
 
 
@@ -411,13 +419,6 @@ class MixedLayerDepth(BaseDepth):
         self.save_path = self.save_dir / f"mixed_layer_depth_delta_sigma_{self.delta_sigma_0}.zarr"
         self.slices_dir = self.save_path.with_name("mixed_layer_depth_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
-
-        self.save_dir.mkdir(exist_ok=True)
-        self.slices_dir.mkdir(exist_ok=True)
-        self.save_dir = Path(save_dir)
-        self.load_dir = Path(load_dir)
-
-        self.save_dir.mkdir(exist_ok=True)
 
     def _interpolate(self, z: np.ndarray, sigma_0: np.ndarray, _depth: np.ndarray | None = None) -> float:
         """Interpolate to find the depth at which the given sigma0 matches the target sigma0.
@@ -476,31 +477,34 @@ class MixedLayerDepth(BaseDepth):
 
     def compute(self) -> None:
         """Compute and save the mixed layer depth from CROCO model output using the threshold method."""
-        with setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
-            print(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+        self.save_dir.mkdir(exist_ok=True)
+        self.slices_dir.mkdir(exist_ok=True)
+
+        with setup_client(setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB")) as client:
+            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+
+            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
+            self.grid = self.open_grid_with_zdepths()
+            self.model = self.open_model_fields()
+            typer.echo("done.")
 
             # Slice the dataset into manageable time chunks
             dataset_slices = self.slice_dataset(self.model)
 
-            print("Computing and saving mixed layer depth slices...", end="", flush=True)
+            typer.echo("Computing and saving mixed layer depth slices...", nl=False)
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
                 mixed_layer_depth_slice = self._process_chunk(ds_slice)
+                self.save_slice(mixed_layer_depth_slice, i)
 
-                # Save the computed mixed layer depths for this slice to a separate zarr file
-                save_path = self.slices_dir / f"mixed_layer_depth_slice_{i + 1}.zarr"
-                if save_path.exists():
-                    tqdm.write(f"File {save_path} already exists. Skipping computation.")
-                    continue
-                self.save_slice(mixed_layer_depth_slice)
-
-            print("done.")
+            typer.echo("done.")
 
             # Concatenate all slices into a single dataset
-            self.concatenate_slices(self.save_path, self.slices_dir)
+            self.concatenate_slices()
 
-            print("All processing complete.")
+            typer.echo("All processing complete.")
+
             client.close()
 
 
@@ -549,11 +553,11 @@ class GridWithDepths(BaseDepth):
         hc = self.model["hc"].to_numpy()
         h = self.model["h"].to_numpy()
         if vertical_coordinate == self.VerticalCoordinate.W:
-            sc = self.model["sc_w"].to_numpy()
-            cs = self.model["Cs_w"].to_numpy()
+            sc = self.model.attrs["sc_w"].to_numpy()
+            cs = self.model.attrs["Cs_w"].to_numpy()
         elif vertical_coordinate == self.VerticalCoordinate.RHO:
-            sc = self.model["sc_r"].to_numpy()
-            cs = self.model["Cs_r"].to_numpy()
+            sc = self.model.attrs["sc_r"].to_numpy()
+            cs = self.model.attrs["Cs_r"].to_numpy()
         else:
             msg = f"Unknown vertical coordinate: {vertical_coordinate}"
             raise ValueError(msg)
@@ -644,13 +648,10 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
         """
         self.mixed_layer_depth_cls = mixed_layer_depth
-        super().__init__(mixed_layer_depth.save_dir, mixed_layer_depth.load_dir)
+        super().__init__(mixed_layer_depth.save_dir, mixed_layer_depth.load_dir, time_slice_size=48)
         self.save_path = self.save_dir / f"density_at_mld_delta_sigma_{mixed_layer_depth.delta_sigma_0}.zarr"
         self.slices_dir = self.save_path.with_name("density_at_mld_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
-
-        self.save_dir.mkdir(exist_ok=True)
-        self.slices_dir.mkdir(exist_ok=True)
 
         if not self.mixed_layer_depth_cls.save_path.exists():
             msg = f"Mixed layer depth file {self.mixed_layer_depth_cls.save_path} does not exist."
@@ -659,7 +660,7 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
         self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"]
 
-    def _interpolate(self, z: np.ndarray, sigma_0: np.ndarray, _depth: np.ndarray | None = None) -> float:
+    def _interpolate(self, z: da.Array, sigma_0: xr.DataArray, _depth: da.Array | None = None) -> float:  # noqa: PLR6301
         """Interpolate to to find sigma_0 at a given depth.
 
         Intended to be used with the xarray.apply_ufunc defined within this script.
@@ -667,22 +668,86 @@ class DensityAtMixedLayerDepth(BaseDepth):
         Args:
             z (np.ndarray): Array of depths.
             sigma_0 (np.ndarray): Array of sigma_0 values corresponding to the depths.
-            depth (np.ndarray): The depth to interpolate to.
+            _depth (np.ndarray): The depth to interpolate to.
 
         Returns:
             float: The depth at which sigma_0 matches surface_sigma_0, or np.nan if not found.
 
         """
+        print(sigma_0.shape, z.shape, _depth)
+        # Skip if all mld is NaN
         if _depth is None:
             return np.nan
-        try:
-            root = np.interp(_depth, z, sigma_0, left=np.nan, right=np.nan)
-        except ValueError:
-            root = np.nan
-        # Satisfy type checker, find_root should always return a float if no exception is raised
-        if type(root) is float:
-            return root
-        return np.nan
+        for i in range(sigma_0.shape[0]):
+            try:
+                root = find_root(
+                    lambda depth: np.interp(depth, z, sigma_0[:, i], left=np.nan, right=np.nan) - _depth,
+                    np.min(z),
+                    np.max(z),
+                )
+            except ValueError:
+                root = np.nan
+        return root
+
+    def interp_vertical_decreasing(self, depth, var, zt):
+        """
+        depth: (eta, xi, s)
+        var:   (eta, xi, s)
+        zt:    (eta, xi)
+        returns: (eta, xi)
+
+        Linear interpolation, fill_value=np.nan, no extrapolation.
+        """
+        ny, nx, nz = depth.shape
+        ncol = ny * nx
+
+        # reshape for vectorized np.interp
+        depth2 = depth.reshape(-1, nz)  # (ncol, nz)
+        var2 = var.reshape(-1, nz)  # (ncol, nz)
+        zt2 = zt.reshape(-1)  # (ncol,)
+
+        # Indices of first depth greater than target (vectorized search)
+        # depth2 is monotonic: bottom->surface (increasing)
+        hi = np.argmax(depth2 >= zt2[:, None], axis=1)
+        hi = np.clip(hi, 1, nz - 1)
+        lo = hi - 1
+
+        # Gather values at bounding indices
+        d0 = depth2[np.arange(ncol), lo]
+        d1 = depth2[np.arange(ncol), hi]
+        v0 = var2[np.arange(ncol), lo]
+        v1 = var2[np.arange(ncol), hi]
+
+        # Linear interpolation weights
+        w = (zt2 - d0) / (d1 - d0)
+        out = v0 + w * (v1 - v0)
+
+        # Mask points outside vertical range
+        out[(zt2 < depth2[:, 0]) | (zt2 > depth2[:, -1])] = np.nan
+
+        return out.reshape(ny, nx)
+
+    def interp_block(self, ds):
+        depth = ds["z_rho"]  # (eta, xi, s)
+        var = ds["sigma_0"]  # (eta, xi, 1, s)
+        zt = ds["mld"]  # (eta, xi, 1)
+
+        # extract time index (length 1)
+        depth = depth.transpose("eta_rho", "xi_rho", "s_rho").values
+        var = var.isel(time=0).transpose("eta_rho", "xi_rho", "s_rho").values
+        zt = zt.isel(time=0).transpose("eta_rho", "xi_rho").values
+
+        out = self.interp_vertical_decreasing(depth, var, zt)
+
+        coords = {k: ds.coords[k] for k in ds.coords if k != "s_rho"}  # keep all coords except vertical
+
+        # return DataArray with the same time dimension (size 1)
+        return xr.DataArray(
+            out[..., np.newaxis],  # add time axis at position 2 (eta,xi,time)
+            dims=("eta_rho", "xi_rho", "time"),
+            coords=coords,
+            attrs=ds.attrs,
+        )
 
     def _process_chunk(self, ds_chunk: xr.Dataset) -> xr.DataArray:
         """Process a chunk of the dataset to compute density at mixed layer depths.
@@ -696,16 +761,34 @@ class DensityAtMixedLayerDepth(BaseDepth):
         """
         ds_chunk = compute_sigma_0(ds_chunk, self.grid)
 
-        density_at_mld_chunk: xr.DataArray = xr.apply_ufunc(
-            self._interpolate,
-            self.grid["z_rho"],
-            ds_chunk["sigma0"],
-            self.mixed_layer_depth,
-            input_core_dims=[["s_rho"], ["s_rho"], ["s_rho"], ["s_rho"]],
-            vectorize=True,
-            dask="parallelized",
-            output_dtypes=[ds_chunk["sigma0"].dtype],
+        template = xr.zeros_like(
+            ds_chunk["mld"],
+            dtype=ds_chunk["mld"].dtype,
         )
+
+        density_at_mld_chunk = xr.map_blocks(
+            self.interp_block,
+            xr.Dataset(
+                {
+                    "sigma_0": ds_chunk["sigma_0"],
+                    "mld": ds_chunk["mld"],
+                    "z_rho": self.grid["z_rho"],
+                },
+            ),
+            template=template,
+        )
+
+        # density_at_mld_chunk: xr.DataArray = xr.apply_ufunc(
+        #     self._interpolate,
+        #     self.grid["z_rho"],
+        #     ds_chunk["sigma0"],
+        #     ds_chunk["mld"],
+        #     input_core_dims=[["s_rho"], ["s_rho"], []],
+        #     output_core_dims=[[]],
+        #     vectorize=True,
+        #     dask="allowed",
+        #     output_dtypes=[self.grid["z_rho"].dtype],
+        # )
         density_at_mld_chunk = density_at_mld_chunk.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
         density_at_mld_chunk = density_at_mld_chunk.rename("density")
 
@@ -713,31 +796,37 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
     def compute(self) -> None:
         """Compute and save the mixed layer depth from CROCO model output using the threshold method."""
-        with setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
-            print(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+        self.save_dir.mkdir(exist_ok=True)
+        self.slices_dir.mkdir(exist_ok=True)
+
+        with setup_client(setup_cluster(n_workers=2, threads_per_worker=2, memory_limit="16GiB")) as client:
+            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+
+            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
+            self.grid = self.open_grid_with_zdepths()
+            self.model = self.open_model_fields()
+            typer.echo("done.")
+
+            # Add mixed layer depth to the model dataset for interpolation
+            self.model["mld"] = self.mixed_layer_depth
 
             # Slice the dataset into manageable time chunks
             dataset_slices = self.slice_dataset(self.model)
 
-            print("Computing and saving mixed layer depth slices...", end="", flush=True)
+            typer.echo("Computing and saving mixed layer depth slices...", nl=False)
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
                 mixed_layer_depth_slice = self._process_chunk(ds_slice)
+                self.save_slice(mixed_layer_depth_slice, i)
 
-                # Save the computed mixed layer depths for this slice to a separate zarr file
-                save_path = self.slices_dir / f"density_at_mixed_layer_depth_slice_{i + 1}.zarr"
-                if save_path.exists():
-                    tqdm.write(f"File {save_path} already exists. Skipping computation.")
-                    continue
-                self.save_slice(mixed_layer_depth_slice)
-
-            print("done.")
+            typer.echo("done.")
 
             # Concatenate all slices into a single dataset
-            self.concatenate_slices(self.save_path, self.slices_dir)
+            self.concatenate_slices()
 
-            print("All processing complete.")
+            typer.echo("All processing complete.")
+
             client.close()
 
 
@@ -789,8 +878,11 @@ def main(
         # Ensure MLD is available; compute if not present
         mld = MixedLayerDepth(delta_sigma_0=float(value), save_dir=save_dir, load_dir=load_dir)
         if not mld.save_path.exists():
-            typer.echo("Mixed layer depth file not found. Computing MLD first...")
-            mld.compute()
+            typer.echo("Mixed layer depth file not found. Would you like to compute it now? [y/n]: ", nl=False)
+            user_input = input()
+            if user_input.lower() == "y":
+                mld.compute()
+        # rechunk_for_mld_density(save_dir=save_dir, load_dir=load_dir, delta_sigma_0=float(value))
         density = DensityAtMixedLayerDepth(mld)
         typer.echo(f"Computing density at MLD for delta_sigma = {value}")
         density.compute()
