@@ -873,7 +873,7 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
             msg += "Please compute it with `MixedLayerDepth.compute()`."
             raise FileNotFoundError(msg)
 
-        self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"]
+        self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"].squeeze()
 
     def _generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Generate variable and global attributes for the isopycnal depth dataset.
