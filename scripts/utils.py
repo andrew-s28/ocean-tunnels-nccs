@@ -2,6 +2,7 @@
 
 import shutil
 import warnings
+import webbrowser
 from pathlib import Path
 
 import gsw
@@ -55,6 +56,9 @@ def setup_client(n_workers: int, threads_per_worker: int, memory_limit: str) -> 
     """
     cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit)
     client = Client(cluster)
+    print(f"Dask cluster setup. Opening dashboard at: {client.dashboard_link}")
+    webbrowser.open_new(client.dashboard_link) if client.dashboard_link else None
+
     return client
 
 

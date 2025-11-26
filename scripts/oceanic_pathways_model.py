@@ -666,7 +666,6 @@ class IsopycnalDepth(BaseInterpolation):
         self.slices_dir.mkdir(exist_ok=True)
 
         with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
-            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
             self.grid = self.open_grid_with_zdepths()
             self.model = self.open_model_fields()
@@ -816,8 +815,6 @@ class MixedLayerDepth(BaseInterpolation):
         self.slices_dir.mkdir(exist_ok=True)
 
         with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
-            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
-
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
             self.grid = self.open_grid_with_zdepths()
             self.model = self.open_model_fields()
@@ -974,8 +971,6 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
         self.slices_dir.mkdir(exist_ok=True)
 
         with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
-            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
-
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
             self.grid = self.open_grid_with_zdepths()
             self.model = self.open_model_fields()
