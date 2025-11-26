@@ -15,8 +15,10 @@
 import shutil
 import warnings
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
+from typing import Any
 
 import gsw
 import numpy as np
@@ -34,15 +36,25 @@ from utils import (
 # Context manager doesn't seem to play nice with dask/xarray apply_ufunc parallelism
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"All-NaN slice encountered")
 
+AUTHOR_ATTRIBUTES = {
+    "creator_name": "Andrew Scherer",
+    "creator_email": "scherand@oregonstate.edu",
+    "creator_institution": "College of Earth, Ocean, and Atmospheric Sciences, Oregon State University",
+    "institution": "College of Earth, Ocean, and Atmospheric Sciences, Oregon State University",
+}
+
 
 class BaseModel(ABC):
     """Base class for loading data and slicing datasets from CROCO model output."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         save_dir: Path | str,
         load_dir: Path | str,
         time_slice_size: int = 100,
+        n_workers: int = 4,
+        threads_per_worker: int = 2,
+        memory_limit: str = "8GB",
     ) -> None:
         """Initialize the BaseModel class.
 
@@ -50,6 +62,9 @@ class BaseModel(ABC):
             save_dir (Path | str): The directory to save the computed depths.
             load_dir (Path | str): The directory to load the model fields from.
             time_slice_size (int): Number of time steps to process in each slice. Default is 100.
+            n_workers (int): Number of Dask workers to use. Default is 4.
+            threads_per_worker (int): Number of threads per Dask worker. Default is 2.
+            memory_limit (str): Memory limit per Dask worker. Default is "8GB".
 
         """
         self.save_dir = Path(save_dir)
@@ -58,6 +73,9 @@ class BaseModel(ABC):
         self.slices_dir: Path
         self.monthly_mean_path: Path
         self.slice_size = time_slice_size
+        self.n_workers = n_workers
+        self.threads_per_worker = threads_per_worker
+        self.memory_limit = memory_limit
 
     def save_slice(
         self,
@@ -104,11 +122,14 @@ class BaseModel(ABC):
         ]
         return slices
 
-    def concatenate_slices(self) -> None:
+    def concatenate_slices(self) -> xr.Dataset:
         """Concatenate all saved slices into a single dataset and remove the slice files.
 
         Args:
             slices_dir (Path): Directory containing the saved slices.
+
+        Returns:
+            xr.Dataset: The concatenated dataset.
 
         """
         typer.echo("Concatenating all slices into a single dataset...", nl=False)
@@ -120,6 +141,16 @@ class BaseModel(ABC):
             compat="no_conflicts",
             coords="minimal",
         )
+
+        return ds
+
+    def save_dataset(self, ds: xr.Dataset) -> None:
+        """Save the concatenated dataset to a zarr store and remove the slice files.
+
+        Args:
+            ds (xr.Dataset): The dataset to save.
+
+        """
         with warnings.catch_warnings():
             msg = "Consolidated metadata is currently not part in the Zarr format 3 specification"
             warnings.filterwarnings("ignore", category=ZarrUserWarning, message=msg)
@@ -128,6 +159,7 @@ class BaseModel(ABC):
             ds.to_zarr(self.save_path)
         typer.echo("done.")
 
+        slice_files = list(self.slices_dir.glob("*.zarr"))
         typer.echo("Cleaning up slice files...", nl=False)
         [shutil.rmtree(f) for f in slice_files]
         self.slices_dir.rmdir()
@@ -424,6 +456,16 @@ class BaseInterpolation(BaseModel, ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Abstract method to generate variable and global attributes for the output dataset.
+
+        Returns:
+            tuple[dict[str, Any], dict[str, Any]]: A tuple containing variable attributes and global attributes.
+
+        """
+        raise NotImplementedError
+
     @staticmethod
     def _interpolate_to_density(depth: np.ndarray, density: np.ndarray, target_density: np.ndarray) -> np.ndarray:
         """Vectorized interpolation to find the depth of a target density level from *decreasing* density values.
@@ -515,6 +557,31 @@ class BaseInterpolation(BaseModel, ABC):
 
         return out.reshape(ny, nx)
 
+    @staticmethod
+    def assign_attributes(
+        ds: xr.Dataset,
+        variable_attributes: dict[str, Any] | None = None,
+        global_attributes: dict[str, Any] | None = None,
+    ) -> xr.Dataset:
+        """Add attributes to the output dataset.
+
+        Args:
+            ds (xr.Dataset): The dataset to add attributes to.
+            variable_attributes (dict[str, Any]): Variable-specific attributes to add to the dataset.
+            global_attributes (dict[str, Any]): Global attributes to add to the dataset.
+
+        Returns:
+            xr.Dataset: The dataset with added attributes.
+
+        """
+        if variable_attributes is not None:
+            for var_name, attrs in variable_attributes.items():
+                if var_name in ds:
+                    ds[var_name].attrs.update(attrs)
+        if global_attributes is not None:
+            ds.attrs.update(global_attributes)
+        return ds
+
 
 class IsopycnalDepth(BaseInterpolation):
     """Class to compute isopycnal depths from CROCO model output."""
@@ -533,6 +600,55 @@ class IsopycnalDepth(BaseInterpolation):
         self.save_path = self.save_dir / f"isopycnal_depth_sigma_{target_sigma_0}.zarr"
         self.slices_dir = self.save_path.with_name("isopycnal_depth_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
+
+    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Generate variable and global attributes for the isopycnal depth dataset.
+
+        Returns:
+            dict[str, Any]: A dictionary containing variable and global attributes.
+
+        """
+        variable_attributes = {str(var): self.model[var].attrs for var in self.model.sizes}
+
+        variable_attributes.update(
+            {
+                "depth": {
+                    "long_name": f"depth of isopycnal surface where sigma_0={self.target_sigma_0} kg/m^3",
+                    "standard_name": "depth_of_isosurface_of_sea_water_sigma_theta",
+                    "units": "m",
+                },
+                "sigma_theta": {
+                    "long_name": "isopycnal surface potential density referenced to the surface",
+                    "standard_name": "sea_water_sigma_theta",
+                    "units": "kg/m^3",
+                },
+            },
+        )
+
+        global_attributes = {
+            "title": "Isopycnal Depth from Oceanic Pathways CROCO Model Output",
+            "summary": (
+                "This dataset contains the depths of the sigma_theta isopycnal surface "
+                "referenced to the surface, i.e., sigma_0. "
+                "Depths are computed using fields from the Oceanic Pathways model, "
+                "a 1/36° regional CROCO model of the California Current System."
+            ),
+            "created_command": f"uv run {Path(__file__).name} isopycnal {self.target_sigma_0} "
+            f"--save-dir {self.save_dir} --load-dir {self.load_dir}",
+            "date_created": f"{datetime.now(UTC).isoformat()}",
+            "history": {"Created": f"{datetime.now(UTC).isoformat()}"},
+            "geospatial_lat_min": float(self.model["lat_rho"].min()),
+            "geospatial_lat_max": float(self.model["lat_rho"].max()),
+            "geospatial_lat_units": "degrees_north",
+            "geospatial_lat_resolution": "1/36 degree",
+            "geospatial_lon_min": float(self.model["lon_rho"].min()),
+            "geospatial_lon_max": float(self.model["lon_rho"].max()),
+            "geospatial_lon_units": "degrees_east",
+            "geospatial_lon_resolution": "1/36 degree",
+            **AUTHOR_ATTRIBUTES,
+        }
+
+        return variable_attributes, global_attributes
 
     def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
         """Process a slice of the dataset to compute isopycnal depths.
@@ -588,7 +704,7 @@ class IsopycnalDepth(BaseInterpolation):
         self.save_dir.mkdir(exist_ok=True)
         self.slices_dir.mkdir(exist_ok=True)
 
-        with setup_client(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
+        with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
             typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
             self.grid = self.open_grid_with_zdepths()
@@ -607,7 +723,14 @@ class IsopycnalDepth(BaseInterpolation):
 
             typer.echo("done.")
 
-            self.concatenate_slices()
+            # Setup final dataset with attributes
+            typer.echo("Finalizing dataset with attributes and saving...", nl=False)
+            ds = self.concatenate_slices()
+            ds = ds.expand_dims(sigma_theta=self.target_sigma_0)
+            var_attrs, global_attrs = self.generate_attributes()
+            ds = self.assign_attributes(ds, var_attrs, global_attrs)
+            self.save_dataset(ds)
+            typer.echo("done.")
 
             typer.echo("All processing complete.")
 
@@ -631,6 +754,56 @@ class MixedLayerDepth(BaseInterpolation):
         self.save_path = self.save_dir / f"mixed_layer_depth_delta_sigma_{self.delta_sigma_0}.zarr"
         self.slices_dir = self.save_path.with_name("mixed_layer_depth_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
+
+    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Generate variable and global attributes for the isopycnal depth dataset.
+
+        Returns:
+            dict[str, Any]: A dictionary containing variable and global attributes.
+
+        """
+        variable_attributes = {str(var): self.model[var].attrs for var in self.model.sizes}
+
+        variable_attributes.update(
+            {
+                "depth": {
+                    "long_name": "thickness of the mixed layer with a "
+                    f"threshold of sigma_0={self.delta_sigma_0} kg/m^3",
+                    "standard_name": "ocean_mixed_layer_thickness_defined_by_sigma_theta",
+                    "units": "m",
+                },
+                "threshold_sigma_theta": {
+                    "long_name": "mixed layer threshold potential density referenced to the surface",
+                    "standard_name": "sea_water_sigma_theta",
+                    "units": "kg/m^3",
+                },
+            },
+        )
+
+        global_attributes = {
+            "title": "Mixed Layer Depth from Oceanic Pathways CROCO Model Output",
+            "summary": (
+                "This dataset contains the thicknesses of the mixed layer defined by a sigma_theta threshold "
+                "referenced to the surface, i.e., sigma_0. "
+                "Depths are computed using fields from the Oceanic Pathways model, "
+                "a 1/36° regional CROCO model of the California Current System."
+            ),
+            "created_command": f"uv run {Path(__file__).name} mld {self.delta_sigma_0} "
+            f"--save-dir {self.save_dir} --load-dir {self.load_dir}",
+            "date_created": f"{datetime.now(UTC).isoformat()}",
+            "history": {"Created": f"{datetime.now(UTC).isoformat()}"},
+            "geospatial_lat_min": float(self.model["lat_rho"].min()),
+            "geospatial_lat_max": float(self.model["lat_rho"].max()),
+            "geospatial_lat_units": "degrees_north",
+            "geospatial_lat_resolution": "1/36 degree",
+            "geospatial_lon_min": float(self.model["lon_rho"].min()),
+            "geospatial_lon_max": float(self.model["lon_rho"].max()),
+            "geospatial_lon_units": "degrees_east",
+            "geospatial_lon_resolution": "1/36 degree",
+            **AUTHOR_ATTRIBUTES,
+        }
+
+        return variable_attributes, global_attributes
 
     def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
         """Process a slice of the dataset to compute isopycnal depths.
@@ -681,7 +854,7 @@ class MixedLayerDepth(BaseInterpolation):
         self.save_dir.mkdir(exist_ok=True)
         self.slices_dir.mkdir(exist_ok=True)
 
-        with setup_client(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
+        with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
             typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
 
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
@@ -701,8 +874,14 @@ class MixedLayerDepth(BaseInterpolation):
 
             typer.echo("done.")
 
-            # Concatenate all slices into a single dataset
-            self.concatenate_slices()
+            # Setup final dataset with attributes
+            typer.echo("Finalizing dataset with attributes and saving...", nl=False)
+            ds = self.concatenate_slices()
+            ds = ds.expand_dims(threshold_sigma_theta=self.delta_sigma_0)
+            var_attrs, global_attrs = self.generate_attributes()
+            ds = self.assign_attributes(ds, var_attrs, global_attrs)
+            self.save_dataset(ds)
+            typer.echo("done.")
 
             typer.echo("All processing complete.")
 
@@ -734,6 +913,57 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
             raise FileNotFoundError(msg)
 
         self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"]
+
+    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Generate variable and global attributes for the isopycnal depth dataset.
+
+        Returns:
+            dict[str, Any]: A dictionary containing variable and global attributes.
+
+        """
+        variable_attributes = {str(var): self.model[var].attrs for var in self.model.sizes}
+
+        variable_attributes.update(
+            {
+                "sigma_theta": {
+                    "long_name": "sigma_theta at the mixed layer depth defined with a "
+                    f"threshold of sigma_0={self.mixed_layer_depth_cls.delta_sigma_0} kg/m^3",
+                    "standard_name": "sea_water_sigma_theta",
+                    "units": "kg/m^3",
+                },
+                "threshold_sigma_theta": {
+                    "long_name": "mixed layer threshold potential density referenced to the surface",
+                    "standard_name": "sea_water_sigma_theta",
+                    "units": "kg/m^3",
+                },
+            },
+        )
+
+        global_attributes = {
+            "title": "Density at mixed layer depth from Oceanic Pathways CROCO Model Output",
+            "summary": (
+                "This dataset contains the density at the mixed layer depth defined by a sigma_theta threshold "
+                "referenced to the surface, i.e., sigma_0. "
+                "Depths are computed using fields from the Oceanic Pathways model, "
+                "a 1/36° regional CROCO model of the California Current System."
+            ),
+            "mixed_layer_depth_file": str(self.mixed_layer_depth_cls.save_path),
+            "created_command": f"uv run {Path(__file__).name} mld_density {self.mixed_layer_depth_cls.delta_sigma_0} "
+            f"--save-dir {self.save_dir} --load-dir {self.load_dir}",
+            "date_created": f"{datetime.now(UTC).isoformat()}",
+            "history": {"Created": f"{datetime.now(UTC).isoformat()}"},
+            "geospatial_lat_min": float(self.model["lat_rho"].min()),
+            "geospatial_lat_max": float(self.model["lat_rho"].max()),
+            "geospatial_lat_units": "degrees_north",
+            "geospatial_lat_resolution": "1/36 degree",
+            "geospatial_lon_min": float(self.model["lon_rho"].min()),
+            "geospatial_lon_max": float(self.model["lon_rho"].max()),
+            "geospatial_lon_units": "degrees_east",
+            "geospatial_lon_resolution": "1/36 degree",
+            **AUTHOR_ATTRIBUTES,
+        }
+
+        return variable_attributes, global_attributes
 
     def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
         """Process a slice of the dataset to compute density at mixed layer depths.
@@ -774,7 +1004,6 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
         # Make sure output is chunked appropriately
         density_at_mld_slice = density_at_mld_slice.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
         density_at_mld_slice = density_at_mld_slice.rename("density")
-        # TODO(Andrew): add attributes to DataArray  # noqa: TD003, FIX002
 
         return density_at_mld_slice
 
@@ -783,7 +1012,7 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
         self.save_dir.mkdir(exist_ok=True)
         self.slices_dir.mkdir(exist_ok=True)
 
-        with setup_client(n_workers=2, threads_per_worker=2, memory_limit="16GiB") as client:
+        with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
             typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
 
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
@@ -806,8 +1035,14 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
 
             typer.echo("done.")
 
-            # Concatenate all slices into a single dataset
-            self.concatenate_slices()
+            # Setup final dataset with attributes
+            typer.echo("Finalizing dataset with attributes and saving...", nl=False)
+            ds = self.concatenate_slices()
+            ds = ds.expand_dims(threshold_sigma_theta=self.mixed_layer_depth_cls.delta_sigma_0)
+            var_attrs, global_attrs = self.generate_attributes()
+            ds = self.assign_attributes(ds, var_attrs, global_attrs)
+            self.save_dataset(ds)
+            typer.echo("done.")
 
             typer.echo("All processing complete.")
 
