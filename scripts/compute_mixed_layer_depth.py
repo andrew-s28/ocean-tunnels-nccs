@@ -90,7 +90,9 @@ def compute_mixed_layer_depth(parent_path: str | Path, delta_sigma: float = 0.2,
     if isinstance(parent_path, str):
         parent_path = Path(parent_path)
 
-    slices_dir = get_mixed_layer_depth_path(parent_path, delta_sigma).with_name("mixed_layer_depth_slices")
+    slices_dir = get_mixed_layer_depth_path(parent_path, delta_sigma).with_name(
+        f"mixed_layer_depth_delta_sigma_{delta_sigma}",
+    )
     slices_dir.mkdir(exist_ok=True)
 
     with setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
@@ -102,7 +104,7 @@ def compute_mixed_layer_depth(parent_path: str | Path, delta_sigma: float = 0.2,
         grid = open_grid_with_zdepths(parent_path)
         print("done.")
 
-        # Find the number of time slices needed
+        # Slice the dataset into manageable time chunks
         dataset_slices = slice_dataset(ds, time_slice_size)
 
         print("Computing and saving mixed layer depth slices...", end="", flush=True)
@@ -122,7 +124,7 @@ def compute_mixed_layer_depth(parent_path: str | Path, delta_sigma: float = 0.2,
 
         save_path = get_mixed_layer_depth_path(parent_path, delta_sigma)
         # Concatenate all slices into a single dataset
-        concatenate_slices(slices_dir, save_path)
+        concatenate_slices(save_path, slices_dir)
 
         print("All processing complete.")
         client.close()
