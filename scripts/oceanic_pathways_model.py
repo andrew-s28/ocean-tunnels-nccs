@@ -76,7 +76,7 @@ class BaseModel(ABC):
         self.threads_per_worker = threads_per_worker
         self.memory_limit = memory_limit
 
-    def save_slice(
+    def _save_slice(
         self,
         slice_da: xr.DataArray,
         index: int,
@@ -100,7 +100,7 @@ class BaseModel(ABC):
             warnings.filterwarnings("ignore", category=UserWarning, message=msg)
             slice_da.to_zarr(save_path)
 
-    def slice_dataset(
+    def _slice_dataset(
         self,
         ds: xr.Dataset,
     ) -> list[xr.Dataset]:
@@ -121,7 +121,7 @@ class BaseModel(ABC):
         ]
         return slices
 
-    def concatenate_slices(self) -> xr.Dataset:
+    def _concatenate_slices(self) -> xr.Dataset:
         """Concatenate all saved slices into a single dataset and remove the slice files.
 
         Args:
@@ -142,7 +142,7 @@ class BaseModel(ABC):
 
         return ds
 
-    def save_dataset(self, ds: xr.Dataset) -> None:
+    def _save_dataset(self, ds: xr.Dataset) -> None:
         """Save the concatenated dataset to a zarr store and remove the slice files.
 
         Args:
@@ -235,57 +235,23 @@ class BaseModel(ABC):
         ds_grid = xr.open_dataset(grid_file)
         return ds_grid
 
-    def compute_monthly_mean(self) -> None:
-        """Compute and save the monthly mean isopycnal depth from saved isopycnal depth slices."""
-        # Open the zarr dataset
-        ds = xr.open_zarr(self.save_path)
-
-        # Resample to monthly means
-        monthly_mean_ds = ds.groupby("time.month").mean(dim="time")
-
-        # Save the monthly mean dataset
-        monthly_mean_ds.to_zarr(self.monthly_mean_path)
-        typer.echo(f"Monthly mean isopycnal depth saved to {self.monthly_mean_path}.")
-
     def open(self) -> xr.Dataset:
-        """Open the isopycnal depth zarr dataset.
+        """Open a zarr store as an xarray Dataset.
 
-        Requires that the isopycnal depth has already been
-        computed and saved with `IsopycnalDepth.compute_isopycnal_depth()`.
+        Requires that the computation has been saved by calling the `compute()` method.
 
         Returns:
-            xr.Dataset: An xarray Dataset containing the isopycnal depth data.
+            xr.Dataset: An xarray Dataset containing the data.
 
         Raises:
-            FileNotFoundError: If the isopycnal depth file does not exist.
+            FileNotFoundError: If the file does not exist.
 
         """
         if not self.save_path.exists():
-            msg = f"Isopycnal depth file {self.save_path} does not exist."
-            msg += "Please compute it with `IsopycnalDepth.compute_isopycnal_depth()`."
+            msg = f"File {self.save_path} does not exist. Please compute it with `compute()`."
             raise FileNotFoundError(msg)
-        ds_isopycnal_depth = xr.open_zarr(self.save_path)
-        return ds_isopycnal_depth
-
-    def open_monthly_mean(self) -> xr.Dataset:
-        """Open the monthly mean isopycnal depth zarr dataset.
-
-        Requires that the monthly mean isopycnal depth has already been
-        computed and saved with `IsopycnalDepth.compute_monthly_mean_isopycnal_depth()`.
-
-        Returns:
-            xr.Dataset: An xarray Dataset containing the monthly mean isopycnal depth data.
-
-        Raises:
-            FileNotFoundError: If the monthly mean isopycnal depth file does not exist.
-
-        """
-        if not self.monthly_mean_path.exists():
-            msg = f"Monthly mean isopycnal depth file {self.monthly_mean_path} does not exist."
-            msg += "Please compute it with `IsopycnalDepth.compute_monthly_mean_isopycnal_depth()`."
-            raise FileNotFoundError(msg)
-        ds_monthly_mean = xr.open_zarr(self.monthly_mean_path)
-        return ds_monthly_mean
+        ds = xr.open_zarr(self.save_path)
+        return ds
 
     @abstractmethod
     def compute(self) -> None:
@@ -452,7 +418,7 @@ class BaseInterpolation(BaseModel, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Abstract method to generate variable and global attributes for the output dataset.
 
         Returns:
@@ -553,7 +519,7 @@ class BaseInterpolation(BaseModel, ABC):
         return out.reshape(ny, nx)
 
     @staticmethod
-    def assign_attributes(
+    def _assign_attributes(
         ds: xr.Dataset,
         variable_attributes: dict[str, Any] | None = None,
         global_attributes: dict[str, Any] | None = None,
@@ -596,7 +562,7 @@ class IsopycnalDepth(BaseInterpolation):
         self.slices_dir = self.save_path.with_name("isopycnal_depth_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
 
-    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Generate variable and global attributes for the isopycnal depth dataset.
 
         Returns:
@@ -707,24 +673,24 @@ class IsopycnalDepth(BaseInterpolation):
             typer.echo("done.")
 
             # Find the number of time slices needed
-            dataset_slices = self.slice_dataset(self.model)
+            dataset_slices = self._slice_dataset(self.model)
 
             typer.echo("Computing and saving isopycnal depth slices...", nl=False)
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing isopycnal depth slices")):
                 isopycnal_depth_slice = self._process_slice(ds_slice)
-                self.save_slice(isopycnal_depth_slice, i)
+                self._save_slice(isopycnal_depth_slice, i)
 
             typer.echo("done.")
 
             # Setup final dataset with attributes
             typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
-            ds = self.concatenate_slices()
+            ds = self._concatenate_slices()
             ds = ds.expand_dims(sigma_theta=[self.target_sigma_0])
-            var_attrs, global_attrs = self.generate_attributes()
-            ds = self.assign_attributes(ds, var_attrs, global_attrs)
-            self.save_dataset(ds)
+            var_attrs, global_attrs = self._generate_attributes()
+            ds = self._assign_attributes(ds, var_attrs, global_attrs)
+            self._save_dataset(ds)
             typer.echo("done.")
 
             typer.echo("All processing complete.")
@@ -750,7 +716,7 @@ class MixedLayerDepth(BaseInterpolation):
         self.slices_dir = self.save_path.with_name("mixed_layer_depth_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
 
-    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Generate variable and global attributes for the isopycnal depth dataset.
 
         Returns:
@@ -858,24 +824,24 @@ class MixedLayerDepth(BaseInterpolation):
             typer.echo("done.")
 
             # Slice the dataset into manageable time chunks
-            dataset_slices = self.slice_dataset(self.model)
+            dataset_slices = self._slice_dataset(self.model)
 
             typer.echo("Computing and saving mixed layer depth slices...", nl=False)
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
                 mixed_layer_depth_slice = self._process_slice(ds_slice)
-                self.save_slice(mixed_layer_depth_slice, i)
+                self._save_slice(mixed_layer_depth_slice, i)
 
             typer.echo("done.")
 
             # Setup final dataset with attributes
             typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
-            ds = self.concatenate_slices()
+            ds = self._concatenate_slices()
             ds = ds.expand_dims(threshold_sigma_theta=[self.delta_sigma_0])
-            var_attrs, global_attrs = self.generate_attributes()
-            ds = self.assign_attributes(ds, var_attrs, global_attrs)
-            self.save_dataset(ds)
+            var_attrs, global_attrs = self._generate_attributes()
+            ds = self._assign_attributes(ds, var_attrs, global_attrs)
+            self._save_dataset(ds)
             typer.echo("done.")
 
             typer.echo("All processing complete.")
@@ -909,7 +875,7 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
 
         self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"]
 
-    def generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Generate variable and global attributes for the isopycnal depth dataset.
 
         Returns:
@@ -1019,24 +985,24 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
             self.model["mld"] = self.mixed_layer_depth
 
             # Slice the dataset into manageable time chunks
-            dataset_slices = self.slice_dataset(self.model)
+            dataset_slices = self._slice_dataset(self.model)
 
             typer.echo("Computing and saving mixed layer depth slices...", nl=False)
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
                 mixed_layer_depth_slice = self._process_slice(ds_slice)
-                self.save_slice(mixed_layer_depth_slice, i)
+                self._save_slice(mixed_layer_depth_slice, i)
 
             typer.echo("done.")
 
             # Setup final dataset with attributes
             typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
-            ds = self.concatenate_slices()
+            ds = self._concatenate_slices()
             ds = ds.expand_dims(threshold_sigma_theta=[self.mixed_layer_depth_cls.delta_sigma_0])
-            var_attrs, global_attrs = self.generate_attributes()
-            ds = self.assign_attributes(ds, var_attrs, global_attrs)
-            self.save_dataset(ds)
+            var_attrs, global_attrs = self._generate_attributes()
+            ds = self._assign_attributes(ds, var_attrs, global_attrs)
+            self._save_dataset(ds)
             typer.echo("done.")
 
             typer.echo("All processing complete.")
