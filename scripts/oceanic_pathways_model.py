@@ -681,8 +681,6 @@ class IsopycnalDepth(BaseInterpolation):
                 isopycnal_depth_slice = self._process_slice(ds_slice)
                 self._save_slice(isopycnal_depth_slice, i)
 
-            typer.echo("done.")
-
             # Setup final dataset with attributes
             typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
             ds = self._concatenate_slices()
@@ -829,8 +827,6 @@ class MixedLayerDepth(BaseInterpolation):
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
                 mixed_layer_depth_slice = self._process_slice(ds_slice)
                 self._save_slice(mixed_layer_depth_slice, i)
-
-            typer.echo("done.")
 
             # Setup final dataset with attributes
             typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
@@ -988,8 +984,6 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
                 mixed_layer_depth_slice = self._process_slice(ds_slice)
                 self._save_slice(mixed_layer_depth_slice, i)
-
-            typer.echo("done.")
 
             # Setup final dataset with attributes
             typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
