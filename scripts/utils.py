@@ -34,14 +34,14 @@ def compute_sigma_0(ds: xr.Dataset, grid: xr.Dataset) -> xr.Dataset:
         ds["salt_abs"],
         ds["temp"],
     )
-    ds["sigma0"] = gsw.density.sigma0(
+    ds["sigma_0"] = gsw.density.sigma0(
         ds["salt_abs"],
         ds["temp_con"],
     )
     return ds
 
 
-def setup_cluster(n_workers: int, threads_per_worker: int, memory_limit: str) -> Client:
+def setup_client(n_workers: int, threads_per_worker: int, memory_limit: str) -> Client:
     """Set up a Dask distributed cluster for parallel processing.
 
     Args:

@@ -18,24 +18,25 @@ from abc import ABC, abstractmethod
 from enum import Enum, auto
 from pathlib import Path
 
-import dask.array as da
 import gsw
 import numpy as np
 import typer
 import xarray as xr
-from scipy.optimize import brentq as find_root
 from tqdm import tqdm
 from zarr.errors import ZarrUserWarning
 
 from utils import (
     compute_sigma_0,
     setup_client,
-    setup_cluster,
 )
 
+# Ignore all-NaN slice warnings globally for interpolations
+# Context manager doesn't seem to play nice with dask/xarray apply_ufunc parallelism
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"All-NaN slice encountered")
 
-class BaseDepth(ABC):
-    """Base class for depth calculations from CROCO model output."""
+
+class BaseModel(ABC):
+    """Base class for loading data and slicing datasets from CROCO model output."""
 
     def __init__(
         self,
@@ -43,7 +44,7 @@ class BaseDepth(ABC):
         load_dir: Path | str,
         time_slice_size: int = 100,
     ) -> None:
-        """Initialize the BaseDepth class.
+        """Initialize the BaseModel class.
 
         Args:
             save_dir (Path | str): The directory to save the computed depths.
@@ -261,251 +262,11 @@ class BaseDepth(ABC):
 
     @abstractmethod
     def compute(self) -> None:
-        """Abstract method to compute depths from CROCO model output."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def _process_chunk(self, ds_chunk: xr.Dataset) -> xr.DataArray:
-        """Abstract method to process a chunk of the dataset to compute depths.
-
-        Args:
-            ds_chunk (xr.Dataset): Chunk of the model dataset.
-
-        Returns:
-            xr.DataArray: DataArray containing the computed depths for the chunk.
-
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def _interpolate(self, z: np.ndarray, sigma_0: np.ndarray, _depth: np.ndarray | None = None) -> float:
-        """Abstract method to interpolate to find the depth at which the given sigma0 matches the target sigma0.
-
-        Args:
-            z (np.ndarray): Array of depths.
-            sigma_0 (np.ndarray): Array of sigma_0 values corresponding to the depths.
-            _depth (np.ndarray | None): Array of depths to interpolate to, if provided.
-
-        Returns:
-            float: The depth at which sigma_0 matches target_sigma_0, or np.nan if not found.
-
-        """
+        """Abstract method to run interpolation computation over CROCO model data."""
         raise NotImplementedError
 
 
-class IsopycnalDepth(BaseDepth):
-    """Class to compute isopycnal depths from CROCO model output."""
-
-    def __init__(self, target_sigma_0: float, save_dir: Path | str, load_dir: Path | str) -> None:
-        """Initialize the IsopycnalDepth class.
-
-        Args:
-            target_sigma_0 (float): The target sigma_0 value for the isopycnal depth.
-            save_dir (Path | str): The directory to save the computed isopycnal depths.
-            load_dir (Path | str): The directory to load the model fields from.
-
-        """
-        self.target_sigma_0 = target_sigma_0
-        super().__init__(save_dir, load_dir)
-        self.save_path = self.save_dir / f"isopycnal_depth_sigma_{target_sigma_0}.zarr"
-        self.slices_dir = self.save_path.with_name("isopycnal_depth_slices")
-        self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
-
-    def _interpolate(self, z: np.ndarray, sigma_0: np.ndarray, _depth: np.ndarray | None = None) -> float:
-        """Interpolate to find the depth at which the given sigma0 matches the target sigma0.
-
-        Intended to be used with the xarray.apply_ufunc defined within this script.
-
-        Args:
-            z (np.ndarray): Array of depths.
-            sigma_0 (np.ndarray): Array of sigma_0 values corresponding to the depths.
-
-        Returns:
-            float: The depth at which sigma_0 matches target_sigma_0, or np.nan if not found.
-
-        """
-        try:
-            root = find_root(
-                lambda depth: np.interp(depth, z, sigma_0, left=np.nan, right=np.nan) - self.target_sigma_0,
-                np.min(z),
-                np.max(z),
-            )
-        except ValueError:
-            root = np.nan
-        # Satisfy type checker, find_root should always return a float if no exception is raised
-        if type(root) is float:
-            return root
-        return np.nan
-
-    def _process_chunk(self, ds_chunk: xr.Dataset) -> xr.DataArray:
-        """Process a chunk of the dataset to compute isopycnal depths.
-
-        Args:
-            ds_chunk (xr.Dataset): Chunk of the model dataset.
-
-        Returns:
-            xr.DataArray: DataArray containing the computed isopycnal depths for the chunk.
-
-        """
-        ds_chunk = compute_sigma_0(ds_chunk, self.grid)
-
-        isopycnal_depth_chunk: xr.DataArray = xr.apply_ufunc(
-            self._interpolate,
-            self.grid["z_rho"],
-            ds_chunk["sigma0"],
-            input_core_dims=[["s_rho"], ["s_rho"]],
-            vectorize=True,
-            dask="parallelized",
-            output_dtypes=[self.grid["z_rho"].dtype],
-        )
-        isopycnal_depth_chunk = isopycnal_depth_chunk.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
-        isopycnal_depth_chunk = isopycnal_depth_chunk.rename("depth")
-
-        return isopycnal_depth_chunk
-
-    def compute(self) -> None:
-        """Compute the depth of a specified isopycnal surface (e.g., sigma_0 = 25.8 kg/m^3) from CROCO model output.
-
-        Takes about 20 hours to run on a home desktop and saves ~20 GB of data
-        when used on the Oceanic Pathways model output.
-
-        """
-        self.save_dir.mkdir(exist_ok=True)
-        self.slices_dir.mkdir(exist_ok=True)
-
-        with setup_client(setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB")) as client:
-            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
-            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
-            self.grid = self.open_grid_with_zdepths()
-            self.model = self.open_model_fields()
-            typer.echo("done.")
-
-            # Find the number of time slices needed
-            dataset_slices = self.slice_dataset(self.model)
-
-            typer.echo("Computing and saving isopycnal depth slices...", nl=False)
-
-            # Process each chunk of times separately
-            for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing isopycnal depth slices")):
-                isopycnal_depth_slice = self._process_chunk(ds_slice)
-                self.save_slice(isopycnal_depth_slice, i)
-
-            typer.echo("done.")
-
-            self.concatenate_slices()
-
-            typer.echo("All processing complete.")
-
-            client.close()
-
-
-class MixedLayerDepth(BaseDepth):
-    """Class to compute mixed layer depths from CROCO model output."""
-
-    def __init__(self, delta_sigma_0: float, save_dir: Path | str, load_dir: Path | str) -> None:
-        """Initialize the MixedLayerDepth class.
-
-        Args:
-            delta_sigma_0 (float): The sigma_0 threshold for mixed layer depth calculation.
-            save_dir (Path | str): The directory to save the computed mixed layer depths.
-            load_dir (Path | str): The directory to load the model fields from.
-
-        """
-        self.delta_sigma_0 = delta_sigma_0
-        super().__init__(save_dir, load_dir)
-        self.save_path = self.save_dir / f"mixed_layer_depth_delta_sigma_{self.delta_sigma_0}.zarr"
-        self.slices_dir = self.save_path.with_name("mixed_layer_depth_slices")
-        self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
-
-    def _interpolate(self, z: np.ndarray, sigma_0: np.ndarray, _depth: np.ndarray | None = None) -> float:
-        """Interpolate to find the depth at which the given sigma0 matches the target sigma0.
-
-        Intended to be used with the xarray.apply_ufunc defined within this script.
-
-        Args:
-            z (np.ndarray): Array of depths.
-            sigma_0 (np.ndarray): Array of sigma_0 values corresponding to the depths.
-
-        Returns:
-            float: The depth at which sigma_0 matches surface_sigma_0, or np.nan if not found.
-
-        """
-        try:
-            root = find_root(
-                lambda depth: np.interp(depth, z, sigma_0, left=np.nan, right=np.nan) - self.threshold_sigma_0,
-                np.min(z),
-                np.max(z),
-            )
-        except ValueError:
-            root = np.nan
-        # Satisfy type checker, find_root should always return a float if no exception is raised
-        if type(root) is float:
-            return root
-        return np.nan
-
-    def _process_chunk(self, ds_chunk: xr.Dataset) -> xr.DataArray:
-        """Process a chunk of the dataset to compute isopycnal depths.
-
-        Args:
-            ds_chunk (xr.Dataset): Chunk of the model dataset.
-
-        Returns:
-            xr.DataArray: DataArray containing the computed isopycnal depths for the chunk.
-
-        """
-        ds_chunk = compute_sigma_0(ds_chunk, self.grid)
-        # grid is from bottom to top so select last index
-        self.threshold_sigma_0 = ds_chunk["sigma0"].isel(s_rho=-1) + self.delta_sigma_0
-
-        mixed_layer_depth_chunk: xr.DataArray = xr.apply_ufunc(
-            self._interpolate,
-            self.grid["z_rho"],
-            ds_chunk["sigma0"],
-            ds_chunk["threshold_sigma_0"],
-            input_core_dims=[["s_rho"], ["s_rho"], []],
-            vectorize=True,
-            dask="parallelized",
-            output_dtypes=[self.grid["z_rho"].dtype],
-        )
-        mixed_layer_depth_chunk = mixed_layer_depth_chunk.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
-        mixed_layer_depth_chunk = mixed_layer_depth_chunk.rename("depth")
-
-        return mixed_layer_depth_chunk
-
-    def compute(self) -> None:
-        """Compute and save the mixed layer depth from CROCO model output using the threshold method."""
-        self.save_dir.mkdir(exist_ok=True)
-        self.slices_dir.mkdir(exist_ok=True)
-
-        with setup_client(setup_cluster(n_workers=4, threads_per_worker=2, memory_limit="8GiB")) as client:
-            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
-
-            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
-            self.grid = self.open_grid_with_zdepths()
-            self.model = self.open_model_fields()
-            typer.echo("done.")
-
-            # Slice the dataset into manageable time chunks
-            dataset_slices = self.slice_dataset(self.model)
-
-            typer.echo("Computing and saving mixed layer depth slices...", nl=False)
-
-            # Process each chunk of times separately
-            for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
-                mixed_layer_depth_slice = self._process_chunk(ds_slice)
-                self.save_slice(mixed_layer_depth_slice, i)
-
-            typer.echo("done.")
-
-            # Concatenate all slices into a single dataset
-            self.concatenate_slices()
-
-            typer.echo("All processing complete.")
-
-            client.close()
-
-
-class GridWithDepths(BaseDepth):
+class GridWithDepths(BaseModel):
     """Class to compute z-depths and pressures for CROCO model output."""
 
     class VerticalCoordinate(Enum):
@@ -631,7 +392,324 @@ class GridWithDepths(BaseDepth):
         ds_grid.to_netcdf(self.save_path)
 
 
-class DensityAtMixedLayerDepth(BaseDepth):
+class BaseInterpolation(BaseModel, ABC):
+    """Base class for interpolating to depths and/or densities from CROCO model output."""
+
+    def __init__(
+        self,
+        save_dir: Path | str,
+        load_dir: Path | str,
+        time_slice_size: int = 100,
+    ) -> None:
+        """Initialize the BaseDepth class.
+
+        Args:
+            save_dir (Path | str): The directory to save the computed depths.
+            load_dir (Path | str): The directory to load the model fields from.
+            time_slice_size (int): Number of time steps to process in each slice. Default is 100.
+
+        """
+        super().__init__(save_dir, load_dir, time_slice_size)
+
+    @abstractmethod
+    def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
+        """Abstract method to process a slice of the dataset to compute depths.
+
+        Args:
+            ds_slice (xr.Dataset): Slice of the model dataset.
+
+        Returns:
+            xr.DataArray: DataArray containing the computed depths for the slice.
+
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def _interpolate_to_density(depth: np.ndarray, density: np.ndarray, target_density: np.ndarray) -> np.ndarray:
+        """Vectorized interpolation to find the depth of a target density level from *decreasing* density values.
+
+        Args:
+            depth (np.ndarray): 3D array of depths with shape (eta, xi, s).
+            density (np.ndarray): 3D array of vertically *decreasing* density values with shape (eta, xi, s).
+            target_density (np.ndarray): 2D array of target density values with shape (eta, xi).
+
+        Returns:
+            np.ndarray: 2D array of interpolated variable values at target depths with shape (eta, xi).
+
+        """
+        ny, nx, nz = depth.shape
+        nxy = nx * ny
+
+        # reshape for vectorized interpolation
+        depth = depth.reshape(-1, nz)  # (nxy, nz)
+        density = density.reshape(-1, nz)  # (nxy, nz)
+        target_density = target_density.reshape(-1)  # (nxy,)
+
+        # Indices of first density less than target, since argmax finds first True
+        # density must be decreasing from bottom->surface
+        hi = np.argmax(density <= target_density[:, None], axis=1)
+        hi = np.clip(hi, 1, nz - 1)
+        lo = hi - 1
+
+        # Get values at bounding indices
+        d0 = depth[np.arange(nxy), lo]
+        d1 = depth[np.arange(nxy), hi]
+        v0 = density[np.arange(nxy), lo]
+        v1 = density[np.arange(nxy), hi]
+
+        # Slope is rise over run
+        slope = (d1 - d0) / (v1 - v0)
+        out = d0 + slope * (target_density - v0)
+
+        # Mask points where density is all NaN
+        out[np.all(np.isnan(density), axis=1)] = np.nan
+
+        # Now mask points outside density range
+        out[(target_density < np.nanmin(density, axis=1)) | (target_density > np.nanmax(density, axis=1))] = np.nan
+
+        return out.reshape(ny, nx)
+
+    @staticmethod
+    def _interpolate_to_depth(depth: np.ndarray, var: np.ndarray, target_depth: np.ndarray) -> np.ndarray:
+        """Vectorized interpolation to find the value of var at target_depth for array with *increasing* depth values.
+
+        Args:
+            depth (np.ndarray): 3D array of *increasing* depths with shape (eta, xi, s).
+            var (np.ndarray): 3D array of variable values with shape (eta, xi, s).
+            target_depth (np.ndarray): 2D array of target depths with shape (eta, xi).
+
+        Returns:
+            np.ndarray: 2D array of interpolated variable values at target depths with shape (eta, xi).
+
+        """
+        ny, nx, nz = depth.shape
+        nxy = nx * ny
+
+        # reshape for vectorized interpolation
+        depth = depth.reshape(-1, nz)  # (nxy, nz)
+        var = var.reshape(-1, nz)  # (nxy, nz)
+        target_depth = target_depth.reshape(-1)  # (nxy,)
+
+        # Indices of first depth greater than target, since argmax finds first True
+        # depth must be monotonic increasing from bottom->surface
+        hi = np.argmax(depth >= target_depth[:, None], axis=1)
+        hi = np.clip(hi, 1, nz - 1)
+        lo = hi - 1
+
+        # Get values at bounding indices
+        d0 = depth[np.arange(nxy), lo]
+        d1 = depth[np.arange(nxy), hi]
+        v0 = var[np.arange(nxy), lo]
+        v1 = var[np.arange(nxy), hi]
+
+        # Slope is rise over run
+        slope = (v1 - v0) / (d1 - d0)
+        out = v0 + slope * (target_depth - d0)
+
+        # Mask points where var is all NaN
+        # This shouldn't be the case for depth but just in case and to match density interpolation
+        out[np.all(np.isnan(depth), axis=1)] = np.nan
+
+        # Now mask points outside vertical range
+        out[(target_depth < depth[:, 0]) | (target_depth > depth[:, -1])] = np.nan
+
+        return out.reshape(ny, nx)
+
+
+class IsopycnalDepth(BaseInterpolation):
+    """Class to compute isopycnal depths from CROCO model output."""
+
+    def __init__(self, target_sigma_0: float, save_dir: Path | str, load_dir: Path | str) -> None:
+        """Initialize the IsopycnalDepth class.
+
+        Args:
+            target_sigma_0 (float): The target sigma_0 value for the isopycnal depth.
+            save_dir (Path | str): The directory to save the computed isopycnal depths.
+            load_dir (Path | str): The directory to load the model fields from.
+
+        """
+        self.target_sigma_0 = target_sigma_0
+        super().__init__(save_dir, load_dir, time_slice_size=12 * 12)
+        self.save_path = self.save_dir / f"isopycnal_depth_sigma_{target_sigma_0}.zarr"
+        self.slices_dir = self.save_path.with_name("isopycnal_depth_slices")
+        self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
+
+    def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
+        """Process a slice of the dataset to compute isopycnal depths.
+
+        Args:
+            ds_slice (xr.Dataset): Slice of the model dataset.
+
+        Returns:
+            xr.DataArray: DataArray containing the computed isopycnal depths for the slice.
+
+        """
+        ds_slice = compute_sigma_0(ds_slice, self.grid)
+        # Construct a DataArray with the target sigma_0 value for each (eta_rho, xi_rho) point
+        ds_slice["target_sigma_0"] = xr.full_like(ds_slice["sigma_0"].isel(s_rho=0), self.target_sigma_0)
+        # Make sure dimensions are in the right order for apply_ufunc and chunking is correct
+        ds_slice = ds_slice.transpose("time", "eta_rho", "xi_rho", "s_rho")
+        ds_slice = ds_slice.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1, "s_rho": -1})
+
+        # Now catch warnings for all-NaN slices
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"All-NaN (slice|axis) encountered")
+            # Using vectorized=True and dask="parallelized"
+            # This means that the function will be applied to each time independently in parallel
+            # This is how the interpolate function is setup to work
+            isopycnal_depth_slice: xr.DataArray = xr.apply_ufunc(
+                self._interpolate_to_density,
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),  # Make sure dims are in correct order
+                ds_slice["sigma_0"],
+                ds_slice["target_sigma_0"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho"]],
+                output_dtypes=[ds_slice["sigma_0"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
+
+        isopycnal_depth_slice = isopycnal_depth_slice.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
+        isopycnal_depth_slice = isopycnal_depth_slice.rename("depth")
+
+        return isopycnal_depth_slice
+
+    def compute(self) -> None:
+        """Compute the depth of a specified isopycnal surface (e.g., sigma_0 = 25.8 kg/m^3) from CROCO model output.
+
+        Takes about 20 hours to run on a home desktop and saves ~20 GB of data
+        when used on the Oceanic Pathways model output.
+
+        """
+        self.save_dir.mkdir(exist_ok=True)
+        self.slices_dir.mkdir(exist_ok=True)
+
+        with setup_client(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
+            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
+            self.grid = self.open_grid_with_zdepths()
+            self.model = self.open_model_fields()
+            typer.echo("done.")
+
+            # Find the number of time slices needed
+            dataset_slices = self.slice_dataset(self.model)
+
+            typer.echo("Computing and saving isopycnal depth slices...", nl=False)
+
+            # Process each chunk of times separately
+            for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing isopycnal depth slices")):
+                isopycnal_depth_slice = self._process_slice(ds_slice)
+                self.save_slice(isopycnal_depth_slice, i)
+
+            typer.echo("done.")
+
+            self.concatenate_slices()
+
+            typer.echo("All processing complete.")
+
+            client.close()
+
+
+class MixedLayerDepth(BaseInterpolation):
+    """Class to compute mixed layer depths from CROCO model output."""
+
+    def __init__(self, delta_sigma_0: float, save_dir: Path | str, load_dir: Path | str) -> None:
+        """Initialize the MixedLayerDepth class.
+
+        Args:
+            delta_sigma_0 (float): The sigma_0 threshold for mixed layer depth calculation.
+            save_dir (Path | str): The directory to save the computed mixed layer depths.
+            load_dir (Path | str): The directory to load the model fields from.
+
+        """
+        self.delta_sigma_0 = delta_sigma_0
+        super().__init__(save_dir, load_dir, time_slice_size=12 * 12)
+        self.save_path = self.save_dir / f"mixed_layer_depth_delta_sigma_{self.delta_sigma_0}.zarr"
+        self.slices_dir = self.save_path.with_name("mixed_layer_depth_slices")
+        self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
+
+    def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
+        """Process a slice of the dataset to compute isopycnal depths.
+
+        Args:
+            ds_slice (xr.Dataset): Slice of the model dataset.
+
+        Returns:
+            xr.DataArray: DataArray containing the computed isopycnal depths for the slice.
+
+        """
+        ds_slice = compute_sigma_0(ds_slice, self.grid)
+        # grid is from bottom to top so select last index
+        ds_slice["threshold_sigma_0"] = ds_slice["sigma_0"].isel(s_rho=-1) + self.delta_sigma_0
+        # Make sure dimensions are in the right order for apply_ufunc and chunking is correct
+        ds_slice = ds_slice.transpose("time", "eta_rho", "xi_rho", "s_rho")
+        ds_slice = ds_slice.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1, "s_rho": -1})
+
+        # Now catch warnings for all-NaN slices
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"All-NaN (slice|axis) encountered")
+            # Using vectorized=True and dask="parallelized"
+            # This means that the function will be applied to each time independently in parallel
+            # This is how the interpolate function is setup to work
+            mixed_layer_depth_slice: xr.DataArray = xr.apply_ufunc(
+                self._interpolate_to_density,
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),  # Make sure dims are in correct order
+                ds_slice["sigma_0"],
+                ds_slice["threshold_sigma_0"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho"]],
+                output_dtypes=[ds_slice["sigma_0"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
+
+        mixed_layer_depth_slice = mixed_layer_depth_slice.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
+        mixed_layer_depth_slice = mixed_layer_depth_slice.rename("depth")
+
+        return mixed_layer_depth_slice
+
+    def compute(self) -> None:
+        """Compute and save the mixed layer depth from CROCO model output using the threshold method."""
+        self.save_dir.mkdir(exist_ok=True)
+        self.slices_dir.mkdir(exist_ok=True)
+
+        with setup_client(n_workers=4, threads_per_worker=2, memory_limit="8GiB") as client:
+            typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
+
+            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
+            self.grid = self.open_grid_with_zdepths()
+            self.model = self.open_model_fields()
+            typer.echo("done.")
+
+            # Slice the dataset into manageable time chunks
+            dataset_slices = self.slice_dataset(self.model)
+
+            typer.echo("Computing and saving mixed layer depth slices...", nl=False)
+
+            # Process each chunk of times separately
+            for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
+                mixed_layer_depth_slice = self._process_slice(ds_slice)
+                self.save_slice(mixed_layer_depth_slice, i)
+
+            typer.echo("done.")
+
+            # Concatenate all slices into a single dataset
+            self.concatenate_slices()
+
+            typer.echo("All processing complete.")
+
+            client.close()
+
+
+class DensityAtMixedLayerDepth(BaseInterpolation):
     """Class to compute density at mixed layer depths from CROCO model output."""
 
     def __init__(self, mixed_layer_depth: MixedLayerDepth) -> None:
@@ -645,7 +723,7 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
         """
         self.mixed_layer_depth_cls = mixed_layer_depth
-        super().__init__(mixed_layer_depth.save_dir, mixed_layer_depth.load_dir, time_slice_size=48)
+        super().__init__(mixed_layer_depth.save_dir, mixed_layer_depth.load_dir, time_slice_size=12 * 12)
         self.save_path = self.save_dir / f"density_at_mld_delta_sigma_{mixed_layer_depth.delta_sigma_0}.zarr"
         self.slices_dir = self.save_path.with_name("density_at_mld_slices")
         self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
@@ -657,145 +735,55 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
         self.mixed_layer_depth = self.mixed_layer_depth_cls.open()["depth"]
 
-    def _interpolate(self, z: da.Array, sigma_0: xr.DataArray, _depth: da.Array | None = None) -> float:
-        """Interpolate to to find sigma_0 at a given depth.
-
-        Intended to be used with the xarray.apply_ufunc defined within this script.
+    def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
+        """Process a slice of the dataset to compute density at mixed layer depths.
 
         Args:
-            z (np.ndarray): Array of depths.
-            sigma_0 (np.ndarray): Array of sigma_0 values corresponding to the depths.
-            _depth (np.ndarray): The depth to interpolate to.
+            ds_slice (xr.Dataset): Slice of the model dataset.
 
         Returns:
-            float: The depth at which sigma_0 matches surface_sigma_0, or np.nan if not found.
+            xr.DataArray: DataArray containing the computed densities at mixed layer depths for the slice.
 
         """
-        print(sigma_0.shape, z.shape, _depth)
-        # Skip if all mld is NaN
-        if _depth is None:
-            return np.nan
-        for i in range(sigma_0.shape[0]):
-            try:
-                root = find_root(
-                    lambda depth: np.interp(depth, z, sigma_0[:, i], left=np.nan, right=np.nan) - _depth,
-                    np.min(z),
-                    np.max(z),
-                )
-            except ValueError:
-                root = np.nan
-        return root
+        ds_slice = compute_sigma_0(ds_slice, self.grid)
+        # Make sure dimensions are in the correct order for interpolation
+        ds_slice = ds_slice.transpose("time", "eta_rho", "xi_rho", "s_rho")
 
-    def interp_vertical_decreasing(self, depth, var, zt):
-        """depth: (eta, xi, s)
-        var:   (eta, xi, s)
-        zt:    (eta, xi)
-        returns: (eta, xi)
+        # Now catch warnings for all-NaN slices
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"All-NaN (slice|axis) encountered")
+            # Using vectorized=True and dask="parallelized"
+            # This means that the function will be applied to each time independently in parallel
+            # This is how the interpolate function is setup to work
+            density_at_mld_slice: xr.DataArray = xr.apply_ufunc(
+                self._interpolate_to_depth,
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),  # same as above comment
+                ds_slice["sigma_0"],
+                ds_slice["mld"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho"]],
+                output_dtypes=[ds_slice["sigma_0"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
 
-        Linear interpolation, fill_value=np.nan, no extrapolation.
-        """
-        ny, nx, nz = depth.shape
-        ncol = ny * nx
+        # Make sure output is chunked appropriately
+        density_at_mld_slice = density_at_mld_slice.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
+        density_at_mld_slice = density_at_mld_slice.rename("density")
+        # TODO(Andrew): add attributes to DataArray  # noqa: TD003, FIX002
 
-        # reshape for vectorized np.interp
-        depth2 = depth.reshape(-1, nz)  # (ncol, nz)
-        var2 = var.reshape(-1, nz)  # (ncol, nz)
-        zt2 = zt.reshape(-1)  # (ncol,)
-
-        # Indices of first depth greater than target (vectorized search)
-        # depth2 is monotonic: bottom->surface (increasing)
-        hi = np.argmax(depth2 >= zt2[:, None], axis=1)
-        hi = np.clip(hi, 1, nz - 1)
-        lo = hi - 1
-
-        # Gather values at bounding indices
-        d0 = depth2[np.arange(ncol), lo]
-        d1 = depth2[np.arange(ncol), hi]
-        v0 = var2[np.arange(ncol), lo]
-        v1 = var2[np.arange(ncol), hi]
-
-        # Linear interpolation weights
-        w = (zt2 - d0) / (d1 - d0)
-        out = v0 + w * (v1 - v0)
-
-        # Mask points outside vertical range
-        out[(zt2 < depth2[:, 0]) | (zt2 > depth2[:, -1])] = np.nan
-
-        return out.reshape(ny, nx)
-
-    def interp_block(self, ds):
-        depth = ds["z_rho"]  # (eta, xi, s)
-        var = ds["sigma_0"]  # (eta, xi, 1, s)
-        zt = ds["mld"]  # (eta, xi, 1)
-
-        # extract time index (length 1)
-        depth = depth.transpose("eta_rho", "xi_rho", "s_rho").values
-        var = var.isel(time=0).transpose("eta_rho", "xi_rho", "s_rho").values
-        zt = zt.isel(time=0).transpose("eta_rho", "xi_rho").values
-
-        out = self.interp_vertical_decreasing(depth, var, zt)
-
-        coords = {k: ds.coords[k] for k in ds.coords if k != "s_rho"}  # keep all coords except vertical
-
-        # return DataArray with the same time dimension (size 1)
-        return xr.DataArray(
-            out[..., np.newaxis],  # add time axis at position 2 (eta,xi,time)
-            dims=("eta_rho", "xi_rho", "time"),
-            coords=coords,
-            attrs=ds.attrs,
-        )
-
-    def _process_chunk(self, ds_chunk: xr.Dataset) -> xr.DataArray:
-        """Process a chunk of the dataset to compute density at mixed layer depths.
-
-        Args:
-            ds_chunk (xr.Dataset): Chunk of the model dataset.
-
-        Returns:
-            xr.DataArray: DataArray containing the computed densities at mixed layer depths for the chunk.
-
-        """
-        ds_chunk = compute_sigma_0(ds_chunk, self.grid)
-
-        template = xr.zeros_like(
-            ds_chunk["mld"],
-            dtype=ds_chunk["mld"].dtype,
-        )
-
-        density_at_mld_chunk = xr.map_blocks(
-            self.interp_block,
-            xr.Dataset(
-                {
-                    "sigma_0": ds_chunk["sigma_0"],
-                    "mld": ds_chunk["mld"],
-                    "z_rho": self.grid["z_rho"],
-                },
-            ),
-            template=template,
-        )
-
-        # density_at_mld_chunk: xr.DataArray = xr.apply_ufunc(
-        #     self._interpolate,
-        #     self.grid["z_rho"],
-        #     ds_chunk["sigma0"],
-        #     ds_chunk["mld"],
-        #     input_core_dims=[["s_rho"], ["s_rho"], []],
-        #     output_core_dims=[[]],
-        #     vectorize=True,
-        #     dask="allowed",
-        #     output_dtypes=[self.grid["z_rho"].dtype],
-        # )
-        density_at_mld_chunk = density_at_mld_chunk.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1})
-        density_at_mld_chunk = density_at_mld_chunk.rename("density")
-
-        return density_at_mld_chunk
+        return density_at_mld_slice
 
     def compute(self) -> None:
         """Compute and save the mixed layer depth from CROCO model output using the threshold method."""
         self.save_dir.mkdir(exist_ok=True)
         self.slices_dir.mkdir(exist_ok=True)
 
-        with setup_client(setup_cluster(n_workers=2, threads_per_worker=2, memory_limit="16GiB")) as client:
+        with setup_client(n_workers=2, threads_per_worker=2, memory_limit="16GiB") as client:
             typer.echo(f"Dask cluster setup. Dashboard link: {client.dashboard_link}")
 
             typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
@@ -813,7 +801,7 @@ class DensityAtMixedLayerDepth(BaseDepth):
 
             # Process each chunk of times separately
             for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing mixed layer depth slices")):
-                mixed_layer_depth_slice = self._process_chunk(ds_slice)
+                mixed_layer_depth_slice = self._process_slice(ds_slice)
                 self.save_slice(mixed_layer_depth_slice, i)
 
             typer.echo("done.")
@@ -826,6 +814,7 @@ class DensityAtMixedLayerDepth(BaseDepth):
             client.close()
 
 
+# Setup Typer CLI app
 app = typer.Typer(
     context_settings={
         "help_option_names": ["-h", "--help"],
@@ -862,7 +851,7 @@ def main(
 
     if mode == "isopycnal":
         iso = IsopycnalDepth(target_sigma_0=float(value), save_dir=save_dir, load_dir=load_dir)
-        typer.echo(f"Computing isopycnal depth for sigma0 = {value}")
+        typer.echo(f"Computing isopycnal depth for sigma_0 = {value}")
         iso.compute()
 
     elif mode == "mld":
@@ -874,11 +863,23 @@ def main(
         # Ensure MLD is available; compute if not present
         mld = MixedLayerDepth(delta_sigma_0=float(value), save_dir=save_dir, load_dir=load_dir)
         if not mld.save_path.exists():
-            typer.echo("Mixed layer depth file not found. Would you like to compute it now? [y/n]: ", nl=False)
+            typer.echo("Mixed layer depth file not found. ", nl=False)
+            typer.echo("Enter 'y' to compute it now, 'n' to exit, or provide the path to an existing file: ", nl=False)
             user_input = input()
             if user_input.lower() == "y":
                 mld.compute()
-        # rechunk_for_mld_density(save_dir=save_dir, load_dir=load_dir, delta_sigma_0=float(value))
+            elif user_input.lower() == "n":
+                typer.echo("Exiting.")
+                raise typer.Exit(code=1)
+            elif Path(user_input).exists():
+                mld = MixedLayerDepth(
+                    delta_sigma_0=float(value),
+                    save_dir=Path(user_input).parent,
+                    load_dir=load_dir,
+                )
+            else:
+                typer.echo("Cannot compute density at MLD without mixed layer depth. Exiting.")
+                raise typer.Exit(code=1)
         density = DensityAtMixedLayerDepth(mld)
         typer.echo(f"Computing density at MLD for delta_sigma = {value}")
         density.compute()
@@ -887,4 +888,5 @@ def main(
 
 
 if __name__ == "__main__":
+    # Run the Typer CLI app
     app()
