@@ -40,7 +40,6 @@ AUTHOR_ATTRIBUTES = {
     "creator_name": "Andrew Scherer",
     "creator_email": "scherand@oregonstate.edu",
     "creator_institution": "College of Earth, Ocean, and Atmospheric Sciences, Oregon State University",
-    "institution": "College of Earth, Ocean, and Atmospheric Sciences, Oregon State University",
 }
 
 
