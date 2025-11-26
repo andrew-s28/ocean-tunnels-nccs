@@ -132,7 +132,6 @@ class BaseModel(ABC):
             xr.Dataset: The concatenated dataset.
 
         """
-        typer.echo("Concatenating all slices into a single dataset...", nl=False)
         slice_files = list(self.slices_dir.glob("*.zarr"))
         slice_files.sort()
         ds = xr.concat(
@@ -157,13 +156,10 @@ class BaseModel(ABC):
             msg = "Sending large graph of size"
             warnings.filterwarnings("ignore", category=UserWarning, message=msg)
             ds.to_zarr(self.save_path)
-        typer.echo("done.")
 
         slice_files = list(self.slices_dir.glob("*.zarr"))
-        typer.echo("Cleaning up slice files...", nl=False)
         [shutil.rmtree(f) for f in slice_files]
         self.slices_dir.rmdir()
-        typer.echo("done.")
 
     def open_model_fields(self) -> xr.Dataset:
         """Open Oceanic Pathways model fields from a parent directory.
@@ -724,9 +720,9 @@ class IsopycnalDepth(BaseInterpolation):
             typer.echo("done.")
 
             # Setup final dataset with attributes
-            typer.echo("Finalizing dataset with attributes and saving...", nl=False)
+            typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
             ds = self.concatenate_slices()
-            ds = ds.expand_dims(sigma_theta=self.target_sigma_0)
+            ds = ds.expand_dims(sigma_theta=[self.target_sigma_0])
             var_attrs, global_attrs = self.generate_attributes()
             ds = self.assign_attributes(ds, var_attrs, global_attrs)
             self.save_dataset(ds)
@@ -875,9 +871,9 @@ class MixedLayerDepth(BaseInterpolation):
             typer.echo("done.")
 
             # Setup final dataset with attributes
-            typer.echo("Finalizing dataset with attributes and saving...", nl=False)
+            typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
             ds = self.concatenate_slices()
-            ds = ds.expand_dims(threshold_sigma_theta=self.delta_sigma_0)
+            ds = ds.expand_dims(threshold_sigma_theta=[self.delta_sigma_0])
             var_attrs, global_attrs = self.generate_attributes()
             ds = self.assign_attributes(ds, var_attrs, global_attrs)
             self.save_dataset(ds)
@@ -1036,9 +1032,9 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
             typer.echo("done.")
 
             # Setup final dataset with attributes
-            typer.echo("Finalizing dataset with attributes and saving...", nl=False)
+            typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
             ds = self.concatenate_slices()
-            ds = ds.expand_dims(threshold_sigma_theta=self.mixed_layer_depth_cls.delta_sigma_0)
+            ds = ds.expand_dims(threshold_sigma_theta=[self.mixed_layer_depth_cls.delta_sigma_0])
             var_attrs, global_attrs = self.generate_attributes()
             ds = self.assign_attributes(ds, var_attrs, global_attrs)
             self.save_dataset(ds)
@@ -1118,8 +1114,6 @@ def main(
         density = DensityAtMixedLayerDepth(mld)
         typer.echo(f"Computing density at MLD for delta_sigma = {value}")
         density.compute()
-
-    typer.echo("Done.")
 
 
 if __name__ == "__main__":
