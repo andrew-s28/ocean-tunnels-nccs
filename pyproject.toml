@@ -8,6 +8,7 @@ dependencies = [
     "cmocean>=4.0.3",
     "dask>=2025.11.0",
     "gsw>=3.6.20",
+    "haversine>=2.9.0",
     "ipykernel>=6.29.5",
     "matplotlib>=3.10.7",
     "numpy>=2.3.4",
@@ -50,9 +51,4 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = [
-    "utils",
-    "compute_z_levels",
-    "compute_isopycnal_depth",
-    "compute_monthly_mean_isopycnal_depth",
-]
+known-first-party = ["utils", "oceanic_pathways_model"]
