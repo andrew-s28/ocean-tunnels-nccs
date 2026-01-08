@@ -192,7 +192,7 @@ class BaseModel(ABC):
         )
 
         # Only need temperature and salinity for density calculations
-        ds = ds[["temp", "salt", "hc", "h", "zeta"]]
+        ds = ds[["temp", "salt", "hc", "h", "zeta"]].to_dataset()  # explicit type conversion, should already by Dataset
 
         return ds
 
@@ -280,8 +280,8 @@ class GridWithDepths(BaseModel):
         self.grid = self.open_grid()
         self.save_path = Path(save_dir) / "croco_grd_with_z.nc"
 
-        # Only need the first time slice since using time-mean zeta and only need hc, h, zeta variables
-        self.model = self.model.isel(time=0)[["hc", "h", "zeta"]]
+        # Use time-mean zeta and only need hc, h, zeta variables
+        self.model = self.model.mean(dim="time")[["hc", "h", "zeta"]]
         # Load into memory for faster computation
         self.model.load()
 
@@ -327,7 +327,8 @@ class GridWithDepths(BaseModel):
             np.ndarray: An array containing the depths of sigma levels.
 
         """
-        # Using time mean zeta since this was the only thing included in model output, but time-varying would be better
+        # Using time mean zeta to simplify calculations, but time-varying would be better
+        # Zeta only varies by ~0.5 m so shouldn't be a huge impact regardless
         z = (
             self.model["zeta"].to_numpy()[:, :, np.newaxis]
             + (self.model["zeta"].to_numpy()[:, :, np.newaxis] + self.model["h"].to_numpy()[:, :, np.newaxis]) * z_0
