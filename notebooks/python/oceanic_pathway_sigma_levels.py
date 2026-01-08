@@ -30,8 +30,6 @@ from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
 from scipy.spatial import Delaunay
 from tqdm import tqdm
 
-from utils import get_mixed_layer_depth_path, open_monthly_mean_isopycnal_depth
-
 if TYPE_CHECKING:
     from cartopy.mpl.geoaxes import GeoAxes
 
@@ -200,13 +198,13 @@ def grid_variable(ds: xr.Dataset, var: str) -> xr.Dataset:
 
 
 # %%
-PARENT_PATH = "D:/avg"
+PARENT_PATH = "D:/avg/test"
 TARGET_SIGMA_0 = 25.8
-
-monthly_mean_25_8 = open_monthly_mean_isopycnal_depth(PARENT_PATH, TARGET_SIGMA_0)
-monthly_mean_25_8
+depth_25_8 = xr.open_zarr(PARENT_PATH + f"/isopycnal_depth_sigma_{TARGET_SIGMA_0}.zarr").squeeze()
 
 # %%
+monthly_mean_25_8 = depth_25_8.groupby("time.month").mean("time")
+monthly_mean_25_8.compute()
 monthly_mean_25_8 = grid_variable(monthly_mean_25_8, "depth")
 
 # %%
@@ -275,10 +273,13 @@ plt.savefig("../misc/oceanic_pathway_isopycnal_depth_25.8.png", dpi=600, bbox_in
 # ## Monthly means mixed layer depth
 
 # %%
-mld = xr.open_zarr(get_mixed_layer_depth_path("D:/avg", delta_sigma=0.1))["depth"]
+THRESHOLD_SIGMA_0 = 0.1
+mld = xr.open_zarr(PARENT_PATH + f"/mixed_layer_depth_delta_sigma_{THRESHOLD_SIGMA_0}.zarr").squeeze()
+
+# %%
 mld_monthly_mean = mld.groupby("time.month").mean("time")
 mld_monthly_mean.compute()
-mld_monthly_mean = grid_variable(mld_monthly_mean.to_dataset().transpose("month", "eta_rho", "xi_rho"), "depth")
+mld_monthly_mean = grid_variable(mld_monthly_mean, "depth")
 
 # %%
 nrows, ncols = 3, 4
@@ -476,16 +477,12 @@ plt.savefig("../misc/oceanic_pathway_25.8_isopycnal_mld_diff.png", dpi=600, bbox
 # ## Monthly mean density at mixed layer depth
 
 # %%
-monthly_mean_density_at_mld = (
-    xr.open_zarr(PARENT_PATH + "/density_at_mld_delta_sigma_0.1.zarr").groupby("time.month").mean("time")
-)
+density_at_mld = xr.open_zarr(PARENT_PATH + f"/density_at_mld_delta_sigma_{THRESHOLD_SIGMA_0}.zarr").squeeze()
 
 # %%
+monthly_mean_density_at_mld = density_at_mld.groupby("time.month").mean("time")
 monthly_mean_density_at_mld.compute()
 monthly_mean_density_at_mld = grid_variable(monthly_mean_density_at_mld, "density")
-
-# %%
-monthly_mean_density_at_mld
 
 # %%
 nrows, ncols = 3, 4
@@ -549,15 +546,3 @@ for month in range(1, 13):
     ax.add_feature(cfeature.STATES, linestyle=":")
 
 plt.savefig("../misc/oceanic_pathway_density_at_mld.png", dpi=600, bbox_inches="tight")
-
-# %% [markdown]
-# # Save gridded datasets
-
-# %%
-monthly_mean_25_8.to_zarr("D:/avg/gridded_monthly_mean_25_8.zarr", mode="w")
-mld_monthly_mean.to_zarr("D:/avg/gridded_monthly_mean_mld.zarr", mode="w")
-monthly_mean_density_at_mld.to_zarr("D:/avg/gridded_monthly_mean_density_at_mld.zarr", mode="w")
-
-
-# %% [markdown]
-#
