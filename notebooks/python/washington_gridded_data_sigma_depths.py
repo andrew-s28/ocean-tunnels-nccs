@@ -20,6 +20,7 @@ from typing import cast
 
 import gsw
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import xarray as xr
 from scipy.optimize import brentq as find_root
@@ -50,6 +51,17 @@ ce09["conservative_temperature"] = gsw.CT_from_t(
     ce09["pressure"],
 )
 ce09["spice"] = gsw.spiciness0(ce09["salinity_absolute"], ce09["conservative_temperature"])
+ce09["alpha"] = gsw.alpha(ce09["salinity_absolute"], ce09["conservative_temperature"], ce09["pressure"])
+ce09["beta"] = gsw.beta(ce09["salinity_absolute"], ce09["conservative_temperature"], ce09["pressure"])
+ce09["grav"] = gsw.grav(ce09["latitude"], ce09["pressure"])
+
+# %%
+# swap negative signs when calculating N^2 components since depth is positive downward in dataset
+ce09["N_squared_Theta"] = (
+    -ce09.differentiate("depth", edge_order=2)["conservative_temperature"] * ce09["alpha"] * ce09["grav"]
+)
+ce09["N_squared_SA"] = ce09.differentiate("depth", edge_order=2)["salinity_absolute"] * ce09["beta"] * ce09["grav"]
+ce09["N_squared_from_Theta_SA"] = ce09["N_squared_Theta"] + ce09["N_squared_SA"]
 
 
 # %%
@@ -204,6 +216,9 @@ oxy_interp = ce09["dissolved_oxygen"].interp(depth=sigma_layers_depth_da)
 temp_interp = ce09["conservative_temperature"].interp(depth=sigma_layers_depth_da)
 sal_interp = ce09["salinity"].interp(depth=sigma_layers_depth_da)
 spice_interp = ce09["spice"].interp(depth=sigma_layers_depth_da)
+n_squared_theta_interp = ce09["N_squared_Theta"].interp(depth=sigma_layers_depth_da)
+n_squared_sa_interp = ce09["N_squared_SA"].interp(depth=sigma_layers_depth_da)
+n_squared_from_theta_sa_interp = ce09["N_squared_from_Theta_SA"].interp(depth=sigma_layers_depth_da)
 
 # %%
 fig, axs = plt.subplots(3, 1, figsize=(8, 6), layout="constrained", sharex=True)
@@ -228,3 +243,53 @@ ax1.axhline(0, color="k", linestyle="-")
 fig.suptitle("Washington offshore profiler water properties on isopycnal surfaces")
 
 plt.savefig("../misc/wa_offshore_profiler_isopycnal_properties_timeseries.png", dpi=300)
+
+# %%
+fig, axs = plt.subplots(3, 1, figsize=(8, 6), layout="constrained", sharex=True)
+ax0 = cast("plt.Axes", axs[0])
+ax1 = cast("plt.Axes", axs[1])
+ax2 = cast("plt.Axes", axs[2])
+
+ax0.plot(ce09["time"], n_squared_theta_interp.sel(sigma_layer=25.8), c="#4477AA")
+ax0.plot(
+    ce09["time"],
+    n_squared_theta_interp.sel(sigma_layer=25.8).rolling(time=30, center=True, min_periods=10).mean(window="hann"),
+    c="#EE6677",
+)
+ax1.plot(ce09["time"], n_squared_sa_interp.sel(sigma_layer=25.8), c="#4477AA")
+ax1.plot(
+    ce09["time"],
+    n_squared_sa_interp.sel(sigma_layer=25.8).rolling(time=30, center=True, min_periods=10).mean(window="hann"),
+    c="#EE6677",
+)
+ax2.plot(ce09["time"], n_squared_from_theta_sa_interp.sel(sigma_layer=25.8), c="#4477AA")
+ax2.plot(
+    ce09["time"],
+    n_squared_from_theta_sa_interp.sel(sigma_layer=25.8)
+    .rolling(time=30, center=True, min_periods=10)
+    .mean(window="hann"),
+    c="#EE6677",
+)
+
+ax0.set_ylabel("$N^2_\\Theta$ ($\\mathsf{s^{-2}}$)")
+ax1.set_ylabel("$N^2_{SA}$ ($\\mathsf{s^{-2}}$)")
+ax2.set_ylabel("$N^2$ ($\\mathsf{s^{-2}}$)")
+
+ax0.axhline(0, color="k", linestyle="-")
+ax1.axhline(0, color="k", linestyle="-")
+ax2.axhline(0, color="k", linestyle="-")
+
+ax0.set_ylim(-2e-4, 2e-4)
+ax1.set_ylim(-0.5e-4, 5e-4)
+ax2.set_ylim(-0.5e-4, 5e-4)
+
+formatter = mticker.ScalarFormatter(useMathText=True)
+formatter.set_scientific(True)
+formatter.set_powerlimits((0, 0))  # forces all numbers into scientific
+ax0.yaxis.set_major_formatter(formatter)
+ax1.yaxis.set_major_formatter(formatter)
+ax2.yaxis.set_major_formatter(formatter)
+
+fig.suptitle("Washington offshore profiler stratification on 25.8 $\\sigma_{\\theta}$ isopycnal surface")
+
+plt.savefig("../misc/wa_offshore_profiler_25.8_isopycnal_n_squared.png", dpi=300)
