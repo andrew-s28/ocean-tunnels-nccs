@@ -219,6 +219,8 @@ spice_interp = ce09["spice"].interp(depth=sigma_layers_depth_da)
 n_squared_theta_interp = ce09["N_squared_Theta"].interp(depth=sigma_layers_depth_da)
 n_squared_sa_interp = ce09["N_squared_SA"].interp(depth=sigma_layers_depth_da)
 n_squared_from_theta_sa_interp = ce09["N_squared_from_Theta_SA"].interp(depth=sigma_layers_depth_da)
+# stratification control index as in https://journals.ametsoc.org/view/journals/phoc/52/8/JPO-D-21-0295.1.xml
+sci = (n_squared_theta_interp - n_squared_sa_interp) / (n_squared_theta_interp + n_squared_sa_interp)
 
 # %%
 fig, axs = plt.subplots(3, 1, figsize=(8, 6), layout="constrained", sharex=True)
@@ -243,6 +245,81 @@ ax1.axhline(0, color="k", linestyle="-")
 fig.suptitle("Washington offshore profiler water properties on isopycnal surfaces")
 
 plt.savefig("../misc/wa_offshore_profiler_isopycnal_properties_timeseries.png", dpi=300)
+
+# %%
+fig, axs = plt.subplots(4, 1, figsize=(8, 8), layout="constrained", sharex=True)
+ax0 = cast("plt.Axes", axs[0])
+ax1 = cast("plt.Axes", axs[1])
+ax2 = cast("plt.Axes", axs[2])
+ax3 = cast("plt.Axes", axs[3])
+
+ax0.plot(ce09["time"], n_squared_theta_interp.sel(sigma_layer=25.8), c="#4477AA")
+ax0.plot(
+    ce09["time"],
+    n_squared_theta_interp.sel(sigma_layer=25.8).rolling(time=30, center=True, min_periods=10).mean(window="hann"),
+    c="#EE6677",
+)
+ax1.plot(ce09["time"], n_squared_sa_interp.sel(sigma_layer=25.8), c="#4477AA")
+ax1.plot(
+    ce09["time"],
+    n_squared_sa_interp.sel(sigma_layer=25.8).rolling(time=30, center=True, min_periods=10).mean(window="hann"),
+    c="#EE6677",
+)
+ax2.plot(ce09["time"], n_squared_from_theta_sa_interp.sel(sigma_layer=25.8), c="#4477AA")
+ax2.plot(
+    ce09["time"],
+    n_squared_from_theta_sa_interp.sel(sigma_layer=25.8)
+    .rolling(time=30, center=True, min_periods=10)
+    .mean(window="hann"),
+    c="#EE6677",
+)
+ax3.plot(ce09["time"], sci.sel(sigma_layer=25.8), c="#4477AA")
+ax3.plot(
+    ce09["time"],
+    sci.sel(sigma_layer=25.8).rolling(time=30, center=True, min_periods=10).mean(window="hann"),
+    c="#EE6677",
+)
+xlim = ax0.get_xlim()
+
+ax0.set_ylabel("$N^2_\\Theta$ ($\\mathsf{s^{-2}}$)")
+ax1.set_ylabel("$N^2_{SA}$ ($\\mathsf{s^{-2}}$)")
+ax2.set_ylabel("$N^2$ ($\\mathsf{s^{-2}}$)")
+ax3.set_ylabel("SCI")
+
+ax0.axhline(0, color="k", linestyle="-")
+ax1.axhline(0, color="k", linestyle="-")
+ax2.axhline(0, color="k", linestyle="-")
+ax3.axhline(0, color="k", linestyle="-")
+
+ax3.fill_between(
+    xlim,
+    -1,
+    1,
+    color="gray",
+    alpha=0.5,
+)
+
+ax0.set_ylim(-2e-4, 2e-4)
+ax1.set_ylim(-0.5e-4, 5e-4)
+ax2.set_ylim(-0.5e-4, 5e-4)
+ax3.set_ylim(-3, 1)
+ax3.set_yticks([-2, -1, 0, 1])
+
+ax0.set_xlim(xlim)
+
+formatter = mticker.ScalarFormatter(useMathText=True)
+formatter.set_scientific(True)
+formatter.set_powerlimits((0, 0))  # forces all numbers into scientific
+ax0.yaxis.set_major_formatter(formatter)
+ax1.yaxis.set_major_formatter(formatter)
+ax2.yaxis.set_major_formatter(formatter)
+
+fig.suptitle("Washington offshore profiler stratification on 25.8 $\\sigma_{\\theta}$ isopycnal surface")
+
+plt.savefig("../misc/wa_offshore_profiler_25.8_isopycnal_n_squared.png", dpi=300)
+
+# %%
+xlim
 
 # %%
 fig, axs = plt.subplots(3, 1, figsize=(8, 6), layout="constrained", sharex=True)
