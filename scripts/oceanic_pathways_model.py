@@ -1340,67 +1340,91 @@ app = typer.Typer(
     rich_markup_mode="rich",
     no_args_is_help=True,
     add_completion=False,
-    help="Compute depths from CROCO model output. Modes: mld, isopycnal, mld_density",
+    help="Compute various quanitites from CROCO model output.",
 )
-
-ALLOWED_MODES = {"mld", "isopycnal", "mld_density"}
 
 SAVE_DIR_OPTION = typer.Option(Path(), "-s", "--save-dir", help="Directory to save results")
 LOAD_DIR_OPTION = typer.Option(Path(), "-l", "--load-dir", help="Directory to load model files from")
 
 
 @app.command()
-def main(
-    mode: str = typer.Argument(..., help="One of: mld, isopycnal, mld_density"),
-    value: float = typer.Argument(..., help="delta_sigma (for mld / mld_density) or target sigma (for isopycnal)"),
+def isopycnal_depth(
+    target_sigma_0: float = typer.Argument(..., help="Target sigma_0 for isopycnal depth"),
     save_dir: Path = SAVE_DIR_OPTION,
     load_dir: Path = LOAD_DIR_OPTION,
 ) -> None:
-    """CLI entry point to compute isopycnal depth, mixed-layer depth, or density at MLD.
+    """Compute isopycnal depth from CROCO model output.
 
-    Raises:
-        typer.Exit: If an invalid mode is provided.
+    Args:
+        target_sigma_0 (float): Target sigma_0 for isopycnal depth.
+        save_dir (Path): Directory to save results.
+        load_dir (Path): Directory to load model files from.
 
     """
-    mode = mode.lower()
-    if mode not in ALLOWED_MODES:
-        typer.echo(f"Invalid mode: {mode}. Choose one of {sorted(ALLOWED_MODES)}")
-        raise typer.Exit(code=1)
+    iso = IsopycnalDepth(target_sigma_0=target_sigma_0, save_dir=save_dir, load_dir=load_dir)
+    typer.echo(f"Computing isopycnal depth for sigma_0 = {target_sigma_0}")
+    iso.compute()
 
-    if mode == "isopycnal":
-        iso = IsopycnalDepth(target_sigma_0=float(value), save_dir=save_dir, load_dir=load_dir)
-        typer.echo(f"Computing isopycnal depth for sigma_0 = {value}")
-        iso.compute()
 
-    elif mode == "mld":
-        mld = MixedLayerDepth(delta_sigma_0=float(value), save_dir=save_dir, load_dir=load_dir)
-        typer.echo(f"Computing mixed layer depth with delta_sigma = {value}")
-        mld.compute()
+@app.command()
+def mixed_layer_depth(
+    delta_sigma_0: float = typer.Argument(..., help="Delta sigma_0 for mixed layer depth using threshold method"),
+    save_dir: Path = SAVE_DIR_OPTION,
+    load_dir: Path = LOAD_DIR_OPTION,
+) -> None:
+    """Compute mixed layer depth from CROCO model output.
 
-    elif mode == "mld_density":
-        # Ensure MLD is available; compute if not present
-        mld = MixedLayerDepth(delta_sigma_0=float(value), save_dir=save_dir, load_dir=load_dir)
-        if not mld.save_path.exists():
-            typer.echo("Mixed layer depth file not found. ", nl=False)
-            typer.echo("Enter 'y' to compute it now, 'n' to exit, or provide the path to an existing file: ", nl=False)
-            user_input = input()
-            if user_input.lower() == "y":
-                mld.compute()
-            elif user_input.lower() == "n":
-                typer.echo("Exiting.")
-                raise typer.Exit(code=1)
-            elif Path(user_input).exists():
-                mld = MixedLayerDepth(
-                    delta_sigma_0=float(value),
-                    save_dir=Path(user_input).parent,
-                    load_dir=load_dir,
-                )
-            else:
-                typer.echo("Cannot compute density at MLD without mixed layer depth. Exiting.")
-                raise typer.Exit(code=1)
-        density = DensityAtMixedLayerDepth(mld)
-        typer.echo(f"Computing density at MLD for delta_sigma = {value}")
-        density.compute()
+    Args:
+        delta_sigma_0 (float): Delta sigma_0 for mixed layer depth.
+        save_dir (Path): Directory to save results.
+        load_dir (Path): Directory to load model files from.
+
+    """
+    mld = MixedLayerDepth(delta_sigma_0=delta_sigma_0, save_dir=save_dir, load_dir=load_dir)
+    typer.echo(f"Computing mixed layer depth with delta_sigma = {delta_sigma_0}")
+    mld.compute()
+
+
+@app.command()
+def mld_density(
+    delta_sigma_0: float = typer.Argument(..., help="Delta sigma_0 for mixed layer depth using threshold method"),
+    save_dir: Path = SAVE_DIR_OPTION,
+    load_dir: Path = LOAD_DIR_OPTION,
+) -> None:
+    """Compute density at mixed layer depth from CROCO model output.
+
+    Args:
+        delta_sigma_0 (float): Delta sigma_0 for mixed layer depth.
+        save_dir (Path): Directory to save results.
+        load_dir (Path): Directory to load model files from.
+
+    Raises:
+        typer.Exit: If mixed layer depth is not available and user opts not to compute it.
+
+    """
+    # Ensure MLD is available; compute if not present
+    mld = MixedLayerDepth(delta_sigma_0=delta_sigma_0, save_dir=save_dir, load_dir=load_dir)
+    if not mld.save_path.exists():
+        typer.echo("Mixed layer depth file not found. ", nl=False)
+        typer.echo("Enter 'y' to compute it now, 'n' to exit, or provide the path to an existing file: ", nl=False)
+        user_input = input()
+        if user_input.lower() == "y":
+            mld.compute()
+        elif user_input.lower() == "n":
+            typer.echo("Exiting.")
+            raise typer.Exit(code=1)
+        elif Path(user_input).exists():
+            mld = MixedLayerDepth(
+                delta_sigma_0=delta_sigma_0,
+                save_dir=Path(user_input).parent,
+                load_dir=load_dir,
+            )
+        else:
+            typer.echo("Cannot compute density at MLD without mixed layer depth. Exiting.")
+            raise typer.Exit(code=1)
+    density = DensityAtMixedLayerDepth(mld)
+    typer.echo(f"Computing density at MLD for delta_sigma = {delta_sigma_0}")
+    density.compute()
 
 
 @app.command()
@@ -1409,7 +1433,7 @@ def buoyancy_frequency(
     save_dir: Path = SAVE_DIR_OPTION,
     load_dir: Path = LOAD_DIR_OPTION,
 ) -> None:
-    """Compute N^2_theta and N^2_salt at a specific isopycnal surface.
+    """Compute N^2_theta and N^2_salt on a specific isopycnal surface.
 
     Calculates the thermal and haline contributions to buoyancy frequency squared
     at the depth of a specified isopycnal surface. If the isopycnal depth has not
