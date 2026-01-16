@@ -1419,6 +1419,8 @@ def mld_density(
                 save_dir=Path(user_input).parent,
                 load_dir=load_dir,
             )
+            # manually set save_path (path that mld was saved too) to user-provided file
+            mld.save_path = Path(user_input)
         else:
             typer.echo("Cannot compute density at MLD without mixed layer depth. Exiting.")
             raise typer.Exit(code=1)
@@ -1465,6 +1467,8 @@ def buoyancy_frequency(
                 save_dir=Path(user_input).parent,
                 load_dir=load_dir,
             )
+            # manually set save_path (path that iso was saved too) to user-provided file
+            iso.save_path = Path(user_input)
         else:
             typer.echo("Cannot compute buoyancy frequency without isopycnal depth. Exiting.")
             raise typer.Exit(code=1)
