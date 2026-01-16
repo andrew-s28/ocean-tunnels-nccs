@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import gsw
 import numpy as np
@@ -46,7 +46,7 @@ AUTHOR_ATTRIBUTES = {
 class BaseModel(ABC):
     """Base class for loading data and slicing datasets from CROCO model output."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         save_dir: Path | str,
         load_dir: Path | str,
@@ -78,13 +78,13 @@ class BaseModel(ABC):
 
     def _save_slice(
         self,
-        slice_da: xr.DataArray,
+        slice_da: xr.DataArray | xr.Dataset,
         index: int,
     ) -> None:
         """Save a computed isopycnal depth slice to a zarr file.
 
         Args:
-            slice_da (xr.DataArray): DataArray containing the computed depths for the slice.
+            slice_da (xr.DataArray | xr.Dataset): DataArray or Dataset containing the computed depths for the slice.
             index (int): Index of the slice to save.
 
         """
@@ -192,8 +192,8 @@ class BaseModel(ABC):
         )
 
         # Only need temperature and salinity for density calculations
-        ds = ds[["temp", "salt", "hc", "h", "zeta"]].to_dataset()  # explicit type conversion, should already by Dataset
-
+        ds = ds[["temp", "salt", "hc", "h", "zeta"]]  # explicit type conversion, should already by Dataset
+        ds = cast("xr.Dataset", ds)
         return ds
 
     def open_grid(self) -> xr.Dataset:
@@ -406,7 +406,7 @@ class BaseInterpolation(BaseModel, ABC):
         super().__init__(save_dir, load_dir, time_slice_size)
 
     @abstractmethod
-    def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray:
+    def _process_slice(self, ds_slice: xr.Dataset) -> xr.DataArray | xr.Dataset:
         """Abstract method to process a slice of the dataset to compute depths.
 
         Args:
@@ -1000,6 +1000,338 @@ class DensityAtMixedLayerDepth(BaseInterpolation):
             client.close()
 
 
+class BuoyancyFrequencyAtIsopycnal(BaseInterpolation):
+    """Class to compute buoyancy frequency components at isopycnal depths from CROCO model output."""
+
+    def __init__(self, isopycnal_depth: IsopycnalDepth) -> None:
+        """Initialize the BuoyancyFrequencyAtIsopycnal class.
+
+        Args:
+            isopycnal_depth (IsopycnalDepth): An instance of the IsopycnalDepth class.
+
+        Raises:
+            FileNotFoundError: If the isopycnal depth file does not exist.
+
+        """
+        self.isopycnal_depth_cls = isopycnal_depth
+        super().__init__(isopycnal_depth.save_dir, isopycnal_depth.load_dir, time_slice_size=100)
+        self.save_path = self.save_dir / f"buoyancy_frequency_at_isopycnal_sigma_{isopycnal_depth.target_sigma_0}.zarr"
+        self.slices_dir = self.save_path.with_name("buoyancy_frequency_at_isopycnal_slices")
+        self.monthly_mean_path = self.save_dir / f"monthly_mean_{self.save_path.name}"
+        self.slice_size = 50  # smaller slice size, probably since we're differentiating and interpolating
+
+        if not self.isopycnal_depth_cls.save_path.exists():
+            msg = f"Isopycnal depth file {self.isopycnal_depth_cls.save_path} does not exist."
+            msg += "Please compute it with `IsopycnalDepth.compute()`."
+            raise FileNotFoundError(msg)
+
+        self.isopycnal_depth = self.isopycnal_depth_cls.open()["depth"].squeeze()
+
+    def _generate_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Generate variable and global attributes for the buoyancy frequency dataset.
+
+        Returns:
+            tuple[dict[str, Any], dict[str, Any]]: A tuple containing variable attributes and global attributes.
+
+        """
+        variable_attributes = {str(var): self.model[var].attrs for var in self.model.sizes}
+
+        variable_attributes.update(
+            {
+                "n_squared_theta": {
+                    "long_name": f"potential temperature contribution to N^2 at sigma_0={self.isopycnal_depth_cls.target_sigma_0} kg/m^3 isopycnal",  # noqa: E501
+                    "standard_name": "square_of_brunt_vaisala_frequency_in_sea_water_due_to_temperature",
+                    "units": "s^-2",
+                },
+                "n_squared_salt": {
+                    "long_name": f"salinity contribution to N^2 at sigma_0={self.isopycnal_depth_cls.target_sigma_0} kg/m^3 isopycnal",  # noqa: E501
+                    "standard_name": "square_of_brunt_vaisala_frequency_in_sea_water_due_to_salinity",
+                    "units": "s^-2",
+                },
+                "sigma_theta": {
+                    "long_name": "isopycnal surface potential density referenced to the surface",
+                    "standard_name": "sea_water_sigma_theta",
+                    "units": "kg/m^3",
+                },
+            },
+        )
+
+        global_attributes = {
+            "title": "Buoyancy Frequency at Isopycnal Depth from Oceanic Pathways CROCO Model Output",
+            "summary": (
+                "This dataset contains the thermal (N^2_theta) and haline (N^2_salt) contributions "
+                "to the buoyancy frequency squared at a specific isopycnal surface. "
+                "Computed using fields from the Oceanic Pathways model, "
+                "a 1/36° regional CROCO model of the California Current System."
+            ),
+            "isopycnal_depth_file": str(self.isopycnal_depth_cls.save_path),
+            "target_sigma_0": float(self.isopycnal_depth_cls.target_sigma_0),
+            "created_command": f"uv run {Path(__file__).name} buoyancy_frequency {self.isopycnal_depth_cls.target_sigma_0} --save-dir {self.save_dir} --load-dir {self.load_dir}",  # noqa: E501
+            "date_created": f"{datetime.now(UTC).isoformat()}",
+            "history": {"Created": f"{datetime.now(UTC).isoformat()}"},
+            "geospatial_lat_min": float(self.model["lat_rho"].min()),
+            "geospatial_lat_max": float(self.model["lat_rho"].max()),
+            "geospatial_lat_units": "degrees_north",
+            "geospatial_lat_resolution": "1/36 degree",
+            "geospatial_lon_min": float(self.model["lon_rho"].min()),
+            "geospatial_lon_max": float(self.model["lon_rho"].max()),
+            "geospatial_lon_units": "degrees_east",
+            "geospatial_lon_resolution": "1/36 degree",
+            **AUTHOR_ATTRIBUTES,
+        }
+
+        return variable_attributes, global_attributes
+
+    @staticmethod
+    def _compute_n_squared_theta(
+        temp: np.ndarray,
+        salt: np.ndarray,
+        z: np.ndarray,
+        p: np.ndarray,
+        lon: np.ndarray,
+        lat: np.ndarray,
+    ) -> np.ndarray:
+        """Compute N^2_theta from temperature with vertical derivative.
+
+        Args:
+            temp (np.ndarray): 3D array of potential temperature with shape (eta, xi, s).
+            salt (np.ndarray): 3D array of practical salinity with shape (eta, xi, s).
+            z (np.ndarray): 3D array of depths with shape (eta, xi, s), increasing upward.
+            p (np.ndarray): 3D array of pressures with shape (eta, xi, s).
+            lon (np.ndarray): 2D array of longitude with shape (eta, xi).
+            lat (np.ndarray): 2D array of latitude with shape (eta, xi).
+
+        Returns:
+            np.ndarray: N^2_theta with shape (eta, xi, s).
+
+        """
+        # Compute vertical derivative of temperature
+        dtemp_dz = np.zeros_like(temp)
+
+        # Interior points
+        dtemp_dz[:, :, 1:-1] = (temp[:, :, 2:] - temp[:, :, :-2]) / (z[:, :, 2:] - z[:, :, :-2])
+
+        # Bottom boundary
+        dz_bottom = z[:, :, 2] - z[:, :, 0]
+        dtemp_dz[:, :, 0] = (-3 * temp[:, :, 0] + 4 * temp[:, :, 1] - temp[:, :, 2]) / dz_bottom
+
+        # Top boundary
+        dz_top = z[:, :, -1] - z[:, :, -3]
+        dtemp_dz[:, :, -1] = (3 * temp[:, :, -1] - 4 * temp[:, :, -2] + temp[:, :, -3]) / dz_top
+
+        # Convert to absolute salinity and conservative temperature for GSW
+        salt_abs = gsw.conversions.SA_from_SP(salt, p, lon[:, :, np.newaxis], lat[:, :, np.newaxis])
+        temp_con = gsw.conversions.CT_from_pt(salt_abs, temp)
+
+        # Compute thermal expansion coefficient
+        alpha = gsw.density.alpha(salt_abs, temp_con, p)
+
+        # Compute N^2_theta = g * alpha * dT/dz
+        g = 9.81  # m/s^2
+        n_squared_theta = g * alpha * dtemp_dz
+
+        return n_squared_theta
+
+    @staticmethod
+    def _compute_n_squared_salt(
+        temp: np.ndarray,
+        salt: np.ndarray,
+        z: np.ndarray,
+        p: np.ndarray,
+        lon: np.ndarray,
+        lat: np.ndarray,
+    ) -> np.ndarray:
+        """Compute N^2_salt from salinity with vertical derivative.
+
+        Args:
+            temp (np.ndarray): 3D array of potential temperature with shape (eta, xi, s).
+            salt (np.ndarray): 3D array of practical salinity with shape (eta, xi, s).
+            z (np.ndarray): 3D array of depths with shape (eta, xi, s), increasing upward.
+            p (np.ndarray): 3D array of pressures with shape (eta, xi, s).
+            lon (np.ndarray): 2D array of longitude with shape (eta, xi).
+            lat (np.ndarray): 2D array of latitude with shape (eta, xi).
+
+        Returns:
+            np.ndarray: N^2_salt with shape (eta, xi, s).
+
+        """
+        # Compute vertical derivative of salinity
+        dsalt_dz = np.zeros_like(salt)
+
+        # Interior points
+        dsalt_dz[:, :, 1:-1] = (salt[:, :, 2:] - salt[:, :, :-2]) / (z[:, :, 2:] - z[:, :, :-2])
+
+        # Bottom boundary
+        dz_bottom = z[:, :, 2] - z[:, :, 0]
+        dsalt_dz[:, :, 0] = (-3 * salt[:, :, 0] + 4 * salt[:, :, 1] - salt[:, :, 2]) / dz_bottom
+
+        # Top boundary
+        dz_top = z[:, :, -1] - z[:, :, -3]
+        dsalt_dz[:, :, -1] = (3 * salt[:, :, -1] - 4 * salt[:, :, -2] + salt[:, :, -3]) / dz_top
+
+        # Convert to absolute salinity and conservative temperature for GSW
+        salt_abs = gsw.conversions.SA_from_SP(salt, p, lon[:, :, np.newaxis], lat[:, :, np.newaxis])
+        temp_con = gsw.conversions.CT_from_pt(salt_abs, temp)
+
+        # Compute haline contraction coefficient
+        beta = gsw.density.beta(salt_abs, temp_con, p)
+
+        # Compute N^2_salt = -g * beta * dS/dz
+        g = 9.81  # m/s^2
+        n_squared_salt = -g * beta * dsalt_dz
+
+        return n_squared_salt
+
+    def _process_slice(self, ds_slice: xr.Dataset) -> xr.Dataset:
+        """Process a slice of the dataset to compute N^2 components at isopycnal depth.
+
+        Computes each component independently to reduce memory usage.
+
+        Args:
+            ds_slice (xr.Dataset): Slice of the model dataset.
+
+        Returns:
+            xr.Dataset: Dataset containing N^2_theta and N^2_salt at isopycnal depth for the slice.
+
+        """
+        # Make sure dimensions are in the correct order
+        ds_slice = ds_slice.transpose("time", "eta_rho", "xi_rho", "s_rho")
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"All-NaN (slice|axis) encountered")
+
+            # Compute N^2_theta in 3D and interpolate (then release from memory)
+            n_squared_theta_3d = xr.apply_ufunc(
+                self._compute_n_squared_theta,
+                ds_slice["temp"],
+                ds_slice["salt"],
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),
+                self.grid["p_rho"].transpose("eta_rho", "xi_rho", "s_rho"),
+                self.grid["lon_rho"],
+                self.grid["lat_rho"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho", "s_rho"]],
+                output_dtypes=[ds_slice["temp"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
+
+            n_squared_theta_at_iso = xr.apply_ufunc(
+                self._interpolate_to_depth,
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),
+                n_squared_theta_3d,
+                ds_slice["iso_depth"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho"]],
+                output_dtypes=[ds_slice["temp"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
+
+            # Release n_squared_theta_3d from memory by deleting reference
+            del n_squared_theta_3d
+
+            # Now compute N^2_salt in 3D and interpolate
+            n_squared_salt_3d = xr.apply_ufunc(
+                self._compute_n_squared_salt,
+                ds_slice["temp"],
+                ds_slice["salt"],
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),
+                self.grid["p_rho"].transpose("eta_rho", "xi_rho", "s_rho"),
+                self.grid["lon_rho"],
+                self.grid["lat_rho"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho", "s_rho"]],
+                output_dtypes=[ds_slice["salt"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
+
+            n_squared_salt_at_iso = xr.apply_ufunc(
+                self._interpolate_to_depth,
+                self.grid["z_rho"].transpose("eta_rho", "xi_rho", "s_rho"),
+                n_squared_salt_3d,
+                ds_slice["iso_depth"],
+                input_core_dims=[
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho", "s_rho"],
+                    ["eta_rho", "xi_rho"],
+                ],
+                output_core_dims=[["eta_rho", "xi_rho"]],
+                output_dtypes=[ds_slice["salt"].dtype],
+                vectorize=True,
+                dask="parallelized",
+            )
+
+            # Release n_squared_salt_3d from memory
+            del n_squared_salt_3d
+
+        # Create output dataset
+        ds_out = xr.Dataset(
+            {
+                "n_squared_theta": n_squared_theta_at_iso.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1}),
+                "n_squared_salt": n_squared_salt_at_iso.chunk({"time": 1, "eta_rho": -1, "xi_rho": -1}),
+            },
+        )
+
+        return ds_out
+
+    def compute(self) -> None:
+        """Compute and save N^2 components at isopycnal depth from CROCO model output."""
+        self.save_dir.mkdir(exist_ok=True)
+        self.slices_dir.mkdir(exist_ok=True)
+
+        with setup_client(self.n_workers, self.threads_per_worker, self.memory_limit) as client:
+            typer.echo(f"Loading model files from {self.load_dir}...", nl=False)
+            self.grid = self.open_grid_with_zdepths()
+            self.model = self.open_model_fields()
+            typer.echo("done.")
+
+            # Add isopycnal depth to the model dataset for interpolation
+            self.model["iso_depth"] = self.isopycnal_depth
+
+            # Slice the dataset into manageable time chunks
+            dataset_slices = self._slice_dataset(self.model)
+
+            typer.echo("Computing and saving buoyancy frequency at isopycnal slices...")
+
+            # Process each chunk of times separately
+            for i, ds_slice in enumerate(tqdm(dataset_slices, desc="Computing buoyancy frequency at isopycnal slices")):
+                buoyancy_slice = self._process_slice(ds_slice)
+                self._save_slice(buoyancy_slice, i)
+
+            # Setup final dataset with attributes
+            typer.echo("Concatenating, adding attributes, and saving dataset...", nl=False)
+            ds = self._concatenate_slices()
+            ds = ds.expand_dims(sigma_theta=[self.isopycnal_depth_cls.target_sigma_0])
+            var_attrs, global_attrs = self._generate_attributes()
+            ds = self._assign_attributes(ds, var_attrs, global_attrs)
+            self._save_dataset(ds)
+            typer.echo("done.")
+
+            typer.echo("All processing complete.")
+
+            client.close()
+
+
 # Setup Typer CLI app
 app = typer.Typer(
     context_settings={
@@ -1069,6 +1401,53 @@ def main(
         density = DensityAtMixedLayerDepth(mld)
         typer.echo(f"Computing density at MLD for delta_sigma = {value}")
         density.compute()
+
+
+@app.command()
+def buoyancy_frequency(
+    target_sigma_0: float = typer.Argument(..., help="Target sigma_0 for isopycnal depth"),
+    save_dir: Path = SAVE_DIR_OPTION,
+    load_dir: Path = LOAD_DIR_OPTION,
+) -> None:
+    """Compute N^2_theta and N^2_salt at a specific isopycnal surface.
+
+    Calculates the thermal and haline contributions to buoyancy frequency squared
+    at the depth of a specified isopycnal surface. If the isopycnal depth has not
+    been computed, you will be prompted to compute it.
+
+    Args:
+        target_sigma_0 (float): Target sigma_0 for isopycnal depth.
+        save_dir (Path): Directory to save results.
+        load_dir (Path): Directory to load model files from.
+
+    Raises:
+        typer.Exit: If isopycnal depth is not available and user opts not to compute it.
+
+    """
+    # Ensure isopycnal depth is available; compute if not present
+    iso = IsopycnalDepth(target_sigma_0=target_sigma_0, save_dir=save_dir, load_dir=load_dir)
+    if not iso.save_path.exists():
+        typer.echo("Isopycnal depth file not found. ", nl=False)
+        typer.echo("Enter 'y' to compute it now, 'n' to exit, or provide the path to an existing file: ", nl=False)
+        user_input = input()
+        if user_input.lower() == "y":
+            iso.compute()
+        elif user_input.lower() == "n":
+            typer.echo("Exiting.")
+            raise typer.Exit(code=1)
+        elif Path(user_input).exists():
+            iso = IsopycnalDepth(
+                target_sigma_0=target_sigma_0,
+                save_dir=Path(user_input).parent,
+                load_dir=load_dir,
+            )
+        else:
+            typer.echo("Cannot compute buoyancy frequency without isopycnal depth. Exiting.")
+            raise typer.Exit(code=1)
+
+    buoy_freq = BuoyancyFrequencyAtIsopycnal(iso)
+    typer.echo(f"Computing buoyancy frequency components at sigma_0 = {target_sigma_0} isopycnal")
+    buoy_freq.compute()
 
 
 if __name__ == "__main__":
